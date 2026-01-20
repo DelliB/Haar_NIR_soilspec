@@ -6,16 +6,21 @@ Rapid, cost-effective soil monitoring is increasingly reliant on handheld Near-I
 
 ## Data Preparation
 
-Dataset: We utilized 2,106 unique mineral topsoil samples from the KSSL database (dry) and a specific subset of 50 samples re-wetted to saturation and scanned continuously until dry to create a wetness gradient (307 unique wet scans).
+Dataset: We utilized 2,106 unique mineral topsoil samples from the KSSL database (dry) and a specific subset of 50 samples, plus 10 from an external source, re-wetted to saturation and scanned continuously until dry to create a wetness gradient (420 unique wet scans).
 Preprocessing: Spectra were interpolated to 2 nm spacing and normalized using the Standard Normal Variate (SNV) algorithm prior to wavelet transformation. Signals were padded to a power of 2 to facilitate iterative bisection.
 
 ## Haar Wavelet Analysis
 
 Transformation: We applied a discrete Haar transform, decomposing the signal into "trends" (signal skeletons/averages) and "fluctuations" (details) using pairwise calculations.
-Compression: Signals were compressed by discarding higher-level fluctuations (back-transforming partial coefficients). We tested compression levels ranging from full signal down to 0.5% retention.
+Compression: Signals were compressed by discarding higher-level fluctuations (back-transforming partial coefficients). We tested compression levels ranging from the full Haar signal down to 0.5% original signal retention.
 
 ## Modeling & Validation
 
 Algorithms: We trained linear Partial Least Squares Regression (PLSR) and tree-based Cubist models.
-Scenarios: Performance was evaluated across three scenarios: dry-calibrated/dry-predicted, dry-calibrated/wet-predicted, and wet-calibrated/wet-predicted.
+Scenarios: Performance was evaluated across five scenarios: dry-calibrated/dry-predicted, subset dry-calibrated/subset dry-predicted, dry-calibrated/wet-predicted, subset dry-calibrated/wet-predicted, and wet-calibrated/wet-predicted.
 Software: Analysis was performed in R (v.4.2.1) using tidyverse, pls, Cubist, and prospectr packages.
+
+# Code Setup
+
+The analysis code is found in the Haar_NIR_wet_analysis.Rmd document while the code for organizing and visualizing results is in Haar_NIR_wet_figures.Rmd. To begin using this code, create Figures, Models, and Perf_results folders in your local repository.
+
