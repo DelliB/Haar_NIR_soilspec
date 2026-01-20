@@ -1,0 +1,3505 @@
+---
+title: "NIR and Haar wet sample predictions"
+author:
+- "D Bloom <develyn.bloom@ufl.edu>, University of Florida"
+- "K Todd-Brown <ktoddbrown@ufl.edu>, University of Florida"
+- "Jose Safanelli <jsafanelli@woodwellclimate.org>, Woodwell Climate RC"
+- "Colleen Partida <cpartida@woodwellclimate.org>, Woodwell Climate RC"
+date: "Spring 2024 - Fall 2025"
+output:
+  pdf_document: 
+    latex_engine: xelatex
+  html_document:
+    df_print: paged
+---
+
+# Setting up environment
+
+## Libraries
+
+Loading libraries.
+
+```{r setup, include=FALSE}
+
+# Use plyr for ddply below
+library(plyr)
+# Load tidyverse for many functions
+library(tidyverse)
+# Load broom to use glance with linear model
+library(broom)
+# Load for SNV preprocessing method
+library(prospectr)
+# Load for PLSR
+library(tidymodels)
+# Load for PLSR
+library(pls)
+# Load for Cubist
+library(Cubist)
+# Load to arrange plots for PLSR results
+library(ggpubr)
+# To read qs files - those used to train the model
+#library(qs)
+# Load DiagrammeR for workflow diagram
+library(DiagrammeR)
+
+```
+
+## Directories
+
+Setting directories.
+
+```{r dir_setup, include=FALSE}
+
+# Data directory Bloom
+dataDir <- '~/Dropbox (UFL)/DB files/Todd_Brown_Lab/Projects/KSSL&Haar/Dry_wet_spec'
+#dataDir <- '~/Dropbox (UFL)/Research/Datasets/SandermanLab_Woodwell/Bloom_share'
+
+## Input directory to load in wet NIR scan data
+wet_dir <- file.path(dataDir, 'Data/')
+
+## Input directory for model training data
+NIR_dir <- file.path(dataDir, 'Data/Training_data')
+
+# Root directory for outputs
+rootDir <- '.'
+
+## Figure output directory
+fig_dir <- file.path(rootDir, 'Figures/')
+
+## Results output directory
+results_dir <- file.path(rootDir, 'Perf_results')
+
+## Output models directory
+models_dir <- file.path(rootDir, 'Models')
+
+```
+
+## Workflows
+
+NIR compression versus accuracy trait prediction workflow.
+
+```{r tradeoff_workflow}
+
+mermaid("
+graph LR
+    
+    lab_data[Lab data]
+    train_set[PLSR model training subset]
+    NIR_scans[NIR spectral scans]
+    valid_set[PLSR model validation subset]
+    Haar_scans[Haar transformed scans]
+    Haar_train_set[Haar PLSR model training subset]
+    Haar_valid_set[Haar PLSR model validation subset]
+    NIR_PLSR[NIR PLSR model]
+    perf_results[validation performance results]
+    Haar_PLSR[Haar PLSR model]
+    
+    subgraph repeat for NIR and PyC scans
+      lab_data --> |80% data split|train_set
+      NIR_scans --> |80% data split|train_set
+      lab_data --> |20% data split|valid_set
+      NIR_scans --> |20% data split|valid_set
+      NIR_scans --> |MR Haar transform|Haar_scans
+      Haar_scans --> |80% data split|Haar_train_set
+      lab_data --> |80% data split|Haar_train_set
+      Haar_scans --> |20% data split|Haar_valid_set
+      lab_data --> |20% data split|Haar_valid_set
+      train_set --> |train model|NIR_PLSR
+      NIR_PLSR --> |validate model|perf_results
+      valid_set --> |validate model|perf_results
+      Haar_train_set --> |train model|Haar_PLSR
+      Haar_PLSR --> |validate model|perf_results
+      Haar_valid_set --> |validate model|perf_results
+    end
+    
+")
+
+# Think about adding a loop to demonstrate repeated draws here so that we can 
+# ...get a distribution of performance metrics -> added 
+# ...G --> |resampling for distribution|E but this diagram alters structure 
+# ...and makes it difficult to understand
+
+```
+
+Wet sample analysis workflow.
+
+```{r wet_workflow}
+
+mermaid("
+graph LR
+    
+    NIR_scans[NIR data]
+    Haar_scans[Haar scans]
+    untransformed_scans[NIR scans]
+    wet_scans[wet data]
+    untransformed_wet_scans[NIR wet scans]
+    dry_model[dry NIR model]
+    wet_model[wet NIR model]
+    Haar_dry_model[Haar dry model]
+    Haar_wet_model[Haar wet model]
+    drywet_predictions[dry NIR wet data prediction]
+    NIR_dry_predictions[dry model validation predictions]
+    NIR_wet_predictions[wet model validation predictions]
+    Haar_drywet_predictions[dry Haar wet data predictions]
+    Haar_dry_predictions[dry model validation predictions]
+    Haar_wet_predictions[wet model validation predictions]
+    model_perf[performance results]
+    
+    subgraph preconditioner
+      NIR_scans --> |Haar transform|Haar_scans
+      NIR_scans --> untransformed_scans
+      wet_scans --> |Haar transform|Haar_wet_scans
+      wet_scans --> untransformed_wet_scans
+    end
+    
+    subgraph model training and validation
+      untransformed_scans --> |model training|dry_model
+      untransformed_wet_scans --> |model training|wet_model
+      Haar_scans --> |model training|Haar_dry_model
+      Haar_wet_scans --> |model training|Haar_wet_model
+      dry_model --> |model validation|NIR_dry_predictions
+      wet_model --> |model validation|NIR_wet_predictions
+      Haar_dry_model --> |model validation|Haar_dry_predictions
+      Haar_wet_model --> |model validation|Haar_wet_predictions
+    end
+    
+    subgraph model predictions
+      dry_model --> drywet_predictions
+      Haar_dry_model --> Haar_drywet_predictions
+      drywet_predictions --> model_perf
+      NIR_dry_predictions --> model_perf
+      NIR_wet_predictions --> model_perf
+      Haar_drywet_predictions --> model_perf
+      Haar_dry_predictions --> model_perf
+      Haar_wet_predictions --> model_perf
+    end
+    
+")
+
+```
+
+## Function
+
+Define function to prepare NIR and Haar data for PLSR performance analysis.
+
+```{r function}
+
+# Function for making data for PLSR function
+make_ML_data <- function(variable_name, signal_data, 
+                         Haar_compression_fold, Lab_data, spectra, Haar_spectra){
+  #variable_name <- 'OC'
+  #signal_data <- 'NIR'
+  
+  temp_property <- Lab_data  %>%
+    dplyr::select(sample_id, all_of(variable_name))
+  
+  # series of if else statements
+  if(signal_data %in% 'NIR'){
+    return(list(data = temp_property %>%
+                  inner_join(spectra, by = "sample_id"),
+                metaData = list(variable = variable_name, 
+                                signal = signal_data, 
+                                signal_compression = as.character(Haar_compression_fold))))
+  }else if(signal_data == 'Haar'){
+    if(!is.finite(Haar_compression_fold) | Haar_compression_fold < 0 | Haar_compression_fold > 12){
+      stop('bad compression size') # if its not bad, it still goes through - because we have stop here we don't need else structure
+    }
+    
+    # -2 since we have 2 id columns
+    signal_size <- (ncol(Haar_spectra)-2) * (1/2)^Haar_compression_fold
+    Haar_index <- 2 + #add the sample_id
+      2:signal_size #skip the final trend (HaarInf_1)
+    
+    data.df <- Haar_spectra[,c(1:2, Haar_index)] # 2 sample ids, fluc, and onward
+    
+    ## Adding property, source data, and energy selection to output table
+    return(list(data = temp_property %>%
+                  inner_join(data.df, by = "sample_id"),
+                metaData = list(variable = variable_name, 
+                                signal = signal_data, 
+                                signal_compression = as.character(Haar_compression_fold))))
+  }
+}
+
+```
+
+# NIR data
+
+Prepare wetness analysis NIR data.  Loading now to remove wet data from dry 
+NIR KSSL samples to ensure predicting using independently trained models.
+
+```{r NIR_wet_data}
+
+wet_train_data <- read_csv(file.path(wet_dir,
+                                          'DryingCurveSpeclib_withLabData.csv')) %>%
+  mutate(sample_id = paste(SAMPLE_ID, ScanPeriod, sep = "_")) %>%
+  dplyr::rename(Grav = "approx.Gravimetric.soil.water.content...at.time.of.scan",
+         WC = "volumetric.water.content",
+         OC = EOC,
+         pH_log = pH) %>%
+  mutate(OC = if_else(OC < 0.02, 0.02, OC)) %>%
+  mutate(OC_log = log1p(OC)) %>%
+  mutate(Clay = if_else(Clay < 0.02, 0.02, Clay)) %>%
+  mutate(Clay_log = log1p(Clay)) %>%
+  pivot_longer(cols = 15:271, 
+               names_to = "Wavelength",
+               values_to = "Reflectance") %>%
+  mutate(Wavelength = as.numeric(str_extract(Wavelength, "\\d+"))) %>%
+  mutate(Wavelength = as.numeric(Wavelength)) %>%
+  mutate(Wavelength = round(Wavelength, digits = 0),
+         Reflectance = round(Reflectance, digits = 2)) %>%
+  pivot_wider(id_cols = 1:17, names_from = Wavelength, values_from = Reflectance) %>%
+  #kept WC in so can use later for plots
+  select(-c(SCAN_ID, ScanPeriod, WOODWELL_ID, Grav, BD, Silt, Sand, TN, CEC)) 
+
+# Standard normal variate pre-processing on spectral scans
+wet_train_data[,9:265] <- standardNormalVariate(X = wet_train_data[,9:265])
+
+# Data-frame with spectral scans only
+wet_nir_spectra <- wet_train_data %>%
+  select(c(sample_id, matches('^\\d+')))
+
+wet_Lab_data <- wet_train_data %>%
+  select(sample_id, OC_log, Clay_log, pH_log, OC, Clay)
+
+```
+
+Load and organize NIR lab and scan data.
+
+```{r NIR_KSSL_data}
+
+# Loading in training data with lab and scan data
+NIR_data <- read_csv(file.path(
+  NIR_dir,
+  'Neospectra_WoodwellKSSL_avg_soil+site+NIR.csv')) %>%
+  ## 2106 unique samples, scanner_name and lab name gives the full 8095 unique 
+  # ...samples
+  dplyr::mutate(sample_id = paste(kssl_id, 1:n(), sep = "_"),
+                kssl_id = paste(kssl_id, sep = "_"),
+                row_id = 1:n()) %>% 
+  #move over the id to the left
+  select(sample_id, kssl_id, row_id, everything()) %>% 
+  select(sample_id,
+         kssl_id,
+         row_id,
+         OC = eoc_tot_c,
+         pH_log = ph_h2o,
+         Clay = clay_tot_psa,
+         #scanner_name,
+         matches('^\\d+\\.\\d+$')) %>%
+  mutate(OC = if_else(OC < 0.02, 0.02, OC)) %>% # set to min tolerance
+  mutate(OC_log = log1p(OC)) %>%
+  mutate(Clay = if_else(Clay < 0.02, 0.02, Clay)) %>%
+  mutate(Clay_log = log1p(Clay)) %>%
+  #select(-c(OC, Clay)) %>%
+  pivot_longer(cols = matches("\\d+"), names_to = "Wavelength", 
+               values_to = "Reflectance") %>% # + selection instead of -
+  #pivot_longer(cols = -c(sample_id, OC, pH, Clay), names_to = "Wavelength", 
+  #             values_to = "Reflectance") %>%
+  mutate(Wavelength = as.numeric(Wavelength)) %>%
+  mutate(Wavelength = round(Wavelength, digits = 0),
+         Reflectance = round(Reflectance, digits = 2)) %>%
+  arrange(row_id, Wavelength) %>%
+  pivot_wider(names_from = Wavelength, values_from = Reflectance) %>%
+  select(-row_id)
+  #unnest()
+# Scans from 2550 to 1350
+
+# Separate lab data
+NIR_Lab_data <- NIR_data %>%
+  select(sample_id, OC_log, pH_log, Clay_log, OC, Clay)
+
+# Separate scan data
+NIR_spectra <- NIR_data %>%
+  select(-c(OC_log, pH_log, Clay_log, OC, Clay))
+
+# Standard normal variate pre-processing
+NIR_spectra[,3:259] <- standardNormalVariate(X = NIR_spectra[,3:259])
+
+# Remove combined data-frame since we do not need it at this point
+rm(NIR_data)
+
+# Making wavelength names the same for NIR and wet scans, so we can use 
+# ...pre-trained NIR Cubist models to predict off wet scans below
+names(wet_nir_spectra) <- names(NIR_spectra %>% 
+                                  mutate(sample_id = paste(sample_id, 
+                                                           kssl_id, 
+                                                           sep = "__")) %>%
+                                  select(-kssl_id))
+
+```
+
+Plotting out NIR lab data.
+
+```{r NIR_lab_data}
+
+NIR_hist.df <- NIR_Lab_data %>%
+  select(c(sample_id, Clay, OC, pH_log)) %>%
+  rename("Clay (%)" = Clay,
+         "OC (%)" = OC,
+         "pH-H2O" = pH_log)
+
+ggplot(data = NIR_hist.df %>%
+         pivot_longer(cols = -sample_id)) +
+  geom_histogram(aes(x = value)) +
+  facet_wrap(~ name, scales = "free_x") +
+  labs(x = "Property Value", y = "Distribution") +
+  theme(panel.grid.minor = element_blank(),
+        axis.title = element_text(size = 13, color = "Black"),
+        axis.text = element_text(size = 13, color = "Black"),
+        strip.background =element_rect(fill="white"),
+        strip.text.x = element_text(size = 13, color = "Black"))
+
+# Saving NIR property histogram figure
+ggsave("NIR_prop_hist_20251118.png", width = 9, height = 4, 
+       path = fig_dir, dpi = 300, units = "in")
+
+```
+
+## NIR scan plot
+
+Plotting NIR scan 36035_3.
+
+```{r NIR_scan_plot}
+
+# NIR scan plot
+NIR_scan_plot <- ggplot(data = NIR_spectra %>%
+                          select(-kssl_id) %>%
+                          filter(sample_id == "36035_3") %>%
+                          pivot_longer(cols = -sample_id, names_to = "Wavelength", values_to = "Reflectance") %>%
+                          mutate(Wavelength = as.numeric(Wavelength)), 
+                        aes(x = Wavelength, y = Reflectance, group = 1)) +
+  geom_line() +
+  labs(y = "Reflectance", x = "Wavelength (nm)") +
+  theme_bw() +
+  theme(legend.position = "none",
+        panel.background = element_blank(),
+        panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(),
+        axis.title = element_text(size = 13, color = "Black"),
+        axis.text = element_text(size = 13, color = "Black"))
+  #scale_x_reverse()
+
+print(NIR_scan_plot)
+
+# Saving NIR scan plot
+ggsave("NIR_scan_plot_20260109.png", width = 6, height = 4,
+       path = fig_dir, dpi = 300, units = "in")
+
+```
+
+## NIR Haar transformed scans & transform of dry data
+
+Haar transformation of dry NIR scans.
+
+```{r Haar_transform_NIR}
+
+if(!file.exists(file.path(NIR_dir, 
+                          'Haar_NIR_train_data_20251117.csv'))){
+  
+  tic <- Sys.time()
+  
+  # Doing Haar transform on all NIR data
+  input_file <- NIR_spectra %>%
+    select(-kssl_id)
+  
+  #info <- subset(input_file, select = c(WOODWELL_ID, ScanPeriod, SAMPLE_ID, Grav, EOC, SCAN_ID))
+  #info <- subset(input_file, select = c(sample_id))
+  
+  nir.df <- input_file %>%
+    #select(-c(sample_id)) %>%
+    #rename(sample_id = SCAN_ID) %>%
+    pivot_longer(cols = -sample_id, 
+                 #cols = everything(), 
+                 names_to = 'Wavelength', values_to = 'Values') %>%
+    dplyr::mutate(Wavelength = as.numeric(Wavelength)) %>%
+    dplyr::mutate(Wavelength = round(Wavelength, digits = 0)) %>%
+    pivot_wider(names_from = Wavelength, values_from = Values)
+  
+  #Remove sample_id and make those row_names
+  sample_names <- nir.df$sample_id
+  nir.df$sample_id <- NULL
+  nir.df <- as.matrix(nir.df)
+  row.names(nir.df) <- sample_names
+  
+  #wavelet_size <- min(2^11, ncol(mir.df))
+  wavelet_size <- 2^9
+  
+  # 2^9 = 512
+  # 512 - 420 = 92 -> need to pad with 92
+  
+  pad_index <- (ncol(nir.df)-1):(ncol(nir.df)-(wavelet_size-ncol(nir.df)))
+  #pad_index <- c()
+  #mir.df[,pad_index] <- mir.df[,pad_index]/2
+  
+  first_index <- c(1:ncol(nir.df), pad_index)
+  
+  odd_indicies <- rep(c(TRUE, FALSE), times = wavelet_size/2)
+  even_indicies <- rep(c(FALSE, TRUE), times = wavelet_size/2)
+  
+  wavelet <- array(NA_real_, dim = c(nrow(nir.df), wavelet_size))
+  
+  #calculate the trend
+  wavelet[ ,1:(wavelet_size/2)] <- (nir.df[,first_index[odd_indicies] ] + 
+                                      nir.df[,first_index[even_indicies]]) / sqrt(2)
+  ##check trend
+  #wavelet[1:10, 1:10]
+  
+  #calculate the flux
+  wavelet[,wavelet_size/2 + (1:(wavelet_size/2))] <- (nir.df[,first_index[odd_indicies]] -
+                                                        nir.df[,first_index[even_indicies]]) / sqrt(2)
+  ##check flux
+  #wavelet[1:10, wavelet_size/2+ (1:10)]
+  
+  #record the names
+  wavelet_names <- rep(NA_character_, length.out = wavelet_size)
+  wavelet_names[wavelet_size/2 + (1:(wavelet_size/2))] <- paste0('H11_I', 1:(wavelet_size/2))
+  
+  for(wavelet_size in 2^( (log(wavelet_size, base=2)-1):1)){
+    #wavelet_size <- 2^10
+    odd_indicies <- c(rep(c(TRUE, FALSE), times = wavelet_size/2), 
+                      rep(FALSE, length.out = ncol(wavelet) - wavelet_size))
+    even_indicies <- c(rep(c(FALSE, TRUE), times = wavelet_size/2), 
+                       rep(FALSE, length.out = ncol(wavelet) - wavelet_size))
+    
+    #calculate the trend
+    trend <- (wavelet[,odd_indicies] + wavelet[,even_indicies]) / sqrt(2)
+    #calculate the flux
+    flux <- (wavelet[,odd_indicies] - wavelet[,even_indicies]) / sqrt(2)
+    
+    wavelet[ ,1:(wavelet_size/2)] <- trend
+    wavelet[,wavelet_size/2 + (1:(wavelet_size/2))] <- flux
+    
+    #save the names
+    wavelet_names[wavelet_size/2 + (1:(wavelet_size/2))] <- paste0('H',log(wavelet_size, base = 2),
+                                                                   '_I', 1:(wavelet_size/2))
+  }
+  
+  wavelet_names[1] <- 'H0_I1'
+  
+  toc <- Sys.time()
+  toc - tic
+  #100 wavelets in 0.99 secs
+  #1000 wavelets in 1.75 sec
+  #1e4 7.9 sec
+  #everything 54 seconds
+  
+  transformed_NIR <- wavelet %>%
+    as.data.frame()
+  names(transformed_NIR) <- wavelet_names
+  transformed_NIR$sample_id <- sample_names
+  #transformed_NIR <- cbind(transformed_NIR, info)
+  
+  # Save Haar wavelet transformed_NIR data
+  write_csv(transformed_NIR, file.path(NIR_dir, "Haar_NIR_train_data_20251117.csv"))
+  
+}
+
+Haar_NIR <- read_csv(file.path(NIR_dir, 
+                               'Haar_NIR_train_data_20251117.csv')) %>%
+  select(sample_id, everything())
+
+```
+
+Plotting Haar transformed NIR scan 36035_3. 
+
+```{r Haar_NIR_scan_plot}
+
+# Haar NIR scan plot
+H_NIR_scan_plot <- ggplot(data = Haar_NIR %>%
+         filter(sample_id == "36035_3") %>%
+         pivot_longer(cols = -sample_id, names_to = "Haar_level", values_to = "Value") %>%
+         mutate(Haar_level = sub(pattern = 'H', replacement = '', x = Haar_level)) %>%
+         mutate(Haar_level = sub(pattern = 'I', replacement = '', x = Haar_level)) %>%
+         mutate(Haar_level = sub(pattern = '_', replacement = '.', x = Haar_level)) %>%
+         mutate(Haar_level = as.numeric(Haar_level)),
+       aes(x = Haar_level, y = Value, group=1)) +
+  geom_line() +
+  xlim(0.0, 12.3) +
+  labs(y = "Energy", x = "Haar level") +
+  theme_bw() +
+  theme(legend.position = "none",
+        panel.background = element_blank(),
+        panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(),
+        axis.title = element_text(size = 13, color = "Black"),
+        axis.text = element_text(size = 13, color = "Black"))
+  #scale_x_continuous(labels = scales::number_format(accuracy = 1))
+  #scale_x_reverse()
+
+print(H_NIR_scan_plot)
+
+# Saving NIR scan plot
+ggsave("Haar_NIR_plot_20260109.png", width = 6, height = 4,
+       path = fig_dir, dpi = 300, units = "in")
+
+```
+
+## Haar back transformation
+
+Reverse Haar transform to assess effects of compression on back-transformed 
+spectra for NIR scan 36035_3.
+
+```{r rev_Haar_trans}
+
+# Selecting 36035_3 sample id and removing sample id column
+Haar_spectra <- Haar_NIR %>%
+  filter(sample_id == "36035_3") %>% 
+  select(-sample_id)
+
+# Setting Haar transforms as a data frame for for loop return below
+Haar_transforms <- data.frame()
+
+# Compressing the Haar data for back transform, without removing trend, as this
+# ...value is needed for math
+for (Haar_compression_fold in 0:8) {
+  
+  signal_size <- (ncol(Haar_spectra)) * (1/2)^Haar_compression_fold
+  Haar_index <- 1:signal_size
+  # did not skip the final trend, since needed for back-transform (HaarInf_1)
+  
+  data.df <- Haar_spectra[, Haar_index]
+  
+  Haar_transforms <- data.df %>%
+    pivot_longer(cols = everything(), names_to = "wavelength", 
+                 values_to = "reflectance") %>%
+    mutate(transform = Haar_compression_fold) %>%
+    rbind(Haar_transforms)
+  
+}
+
+back_trans_loop_res <- data.frame()
+
+# Back transformation for loop
+for (MRA in 0:8) {
+  
+  # Selecting 25557XS sample id and removing sample id, as this is the same 
+  # ...sample from spectra plots above and to have only Haar spectra
+  f_back <- Haar_transforms %>%
+    filter(transform == MRA) %>%
+    select(-transform) %>%
+    pivot_wider(names_from = "wavelength", values_from = "reflectance")
+  
+  # Turning Haar signal into a matrix to ensure correct dimensions
+  f_back <- as.matrix(f_back)
+  
+  # Creating a.i to fill in back-transform
+  a.i <- matrix(data = NA, nrow = nrow(f_back), 
+                ncol = ncol(f_back))
+  
+  # Giving a.i the trend value from f_back
+  a.i[,1] <- f_back[,1]
+  
+  # Identifying number of compression run during multi-resolution Haar transform
+  transforms <- log2(ncol(f_back))
+  
+  # For loop running through the 11 back transforms, calculating spectra values 
+  # ...using trend and fluctuation values
+  for (level_index in 2^(1:transforms-1)) {
+    
+    temp_trend <- a.i[,1:level_index]
+    dim(temp_trend) <- c(nrow(f_back), level_index)
+    
+    index_trend <- 1:level_index 
+    index_flux <- level_index + 1:level_index
+    index_back_add <- seq(from = 1, to = level_index*2, by = 2) # all the odds
+    index_back_subtract <- seq(from = 2, to = level_index*2, by = 2) # all the evens
+    a.i[,index_back_add] <- (temp_trend[,index_trend] + f_back[,index_flux])/sqrt(2)
+    a.i[,index_back_subtract] <- (temp_trend[,index_trend] - f_back[,index_flux])/sqrt(2)
+    
+  }
+  
+  back_trans_loop_res <- a.i %>%
+    as_tibble() %>%
+    pivot_longer(cols = everything(), names_to = "wavelength", 
+                 values_to = "reflectance") %>%
+    mutate(wavelength = as.numeric(sub(pattern = 'V', replacement = '', 
+                                       x = wavelength))) %>%
+    mutate(MRA_value = MRA) %>%
+    rbind(back_trans_loop_res)
+  
+}
+
+```
+
+Organizing back-transformed spectra x-axis for plotting.
+
+```{r rev_org}
+
+# X-axis labels for back transformed figure
+x_axis_names.df <- NIR_spectra %>%
+  filter(sample_id == "36035_3") %>%
+  #ungroup(sample_id) %>%
+  select(-c(sample_id, kssl_id))
+
+# Names for back transform x-axis from 600 to 4000
+x_axis_names <- as.data.frame(as.numeric(names(x_axis_names.df))) %>%
+  dplyr::rename("wavelength" = "as.numeric(names(x_axis_names.df))") %>%
+  dplyr::arrange(row_number())
+
+# Organizing back transformed signal for plotting
+# Need to remove pad of last 254 values, removing 257 to 512
+back_transform_0 <- back_trans_loop_res %>%
+  filter(MRA_value == 0) %>%
+  filter(wavelength <= 257) %>% # removed 255 values
+  select(-wavelength) %>%
+  cbind(x_axis_names)
+
+back_transform <- data.frame()
+
+for (length in c(1,2,3,4,5,6,7,8)) {
+  
+  # Lengths to remove for each transform 128, 64, 32, 16, 8, 4, 2, 1
+  reduced_length <- round(((2^9)/(2^length)) - (255/(2^length)))
+  
+  back_transform <- back_trans_loop_res %>%
+    filter(MRA_value == length) %>%
+    filter(wavelength <= reduced_length) %>%
+    select(-wavelength) %>%
+    mutate(wavelength = round(seq(from = 1350, to = 2550, 
+                                  length.out = reduced_length), digits = 0)) %>%
+    rbind(back_transform)
+    
+}
+
+# Combine non-compressed back-transformed spectra with compressed spectra from 
+# ...for loop for visualizations below
+full_back_trans.df <- back_transform_0 %>%
+  rbind(back_transform) %>%
+  #mutate(MRA_value = as.factor(MRA_value)) %>%
+  dplyr::rename(Wavelength = wavelength,
+         Reflectance = reflectance)
+
+```
+
+Plot of back-transformed NIR scan with wavenumber and absorbance values.
+
+```{r rev_Haar_plot}
+
+# Full Haar signal back-transform NIR scan plot
+Full_BT_scan_plot <- ggplot(data = full_back_trans.df %>%
+                             filter(MRA_value == 0),
+                            aes(x = Wavelength, y = Reflectance), group = 1) +
+  geom_line() +
+  labs(y = "Reflectance", x = "Wavelength (nm)") +
+  theme_bw() +
+  theme(legend.position = "right",
+        panel.background = element_blank(),
+        panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(),
+        axis.title = element_text(size = 13, color = "Black"),
+        axis.text = element_text(size = 13, color = "Black"))
+  #scale_x_reverse() # Don't think have to reverse, it is not getting flipped
+  # Have to fix the x-axis names -> make them go from high of NIR to low
+
+print(Full_BT_scan_plot)
+
+# Saving reverse Haar NIR scan plot
+ggsave("RevHaar_NIR_plot_20260109.png", width = 6, height = 4,
+       path = fig_dir, dpi = 300, units = "in")
+
+# Organizing full_back_trans.df to enable proper labeling of Haar levels for 
+# ...back transform plot
+full_back_trans_labels.df <- full_back_trans.df %>%
+  #mutate(Reflectance = rev(Reflectance), .by = MRA_value) %>%
+  mutate(signal_def = ifelse(MRA_value == '0', 
+                             'Full Haar', MRA_value),
+         signal_def = ifelse(MRA_value == '1', 
+                             '60% Haar', signal_def),
+         signal_def = ifelse(MRA_value == '2', 
+                             '30% Haar', signal_def),
+         signal_def = ifelse(MRA_value == '3', 
+                             '15% Haar', signal_def),
+         signal_def = ifelse(MRA_value == '4', 
+                             '8.0% Haar', signal_def),
+         signal_def = ifelse(MRA_value == '5', 
+                             '4.0% Haar', signal_def),
+         signal_def = ifelse(MRA_value == '6', 
+                             '2.0% Haar', signal_def),
+         signal_def = ifelse(MRA_value == '7', 
+                             '1.0% Haar', signal_def),
+         signal_def = ifelse(MRA_value == '8', 
+                             '0.5% Haar', signal_def)) %>%
+  mutate(line_type = ifelse(MRA_value == 6, "solid", "longdashed"))
+
+# Full and compressed Haar signal back-transformed NIR scan plot
+All_BT_scan_plot <- ggplot(data = full_back_trans_labels.df,
+                           aes(x = Wavelength, y = Reflectance, 
+                                 color = as.factor(signal_def),
+                               linetype = line_type)) +
+  geom_line() +
+  geom_point(data = full_back_trans_labels.df %>% 
+               filter(MRA_value == 8), 
+             aes(x = Wavelength, y = Reflectance, 
+                 color = as.factor(signal_def))) +
+  labs(y = "Reflectance", x = "Wavelength (nm)") +
+  theme_bw() +
+  theme(legend.position = "bottom",
+        legend.title = element_blank(),
+        legend.text = element_text(size = 13, color = "Black"),
+        panel.background = element_blank(),
+        panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(),
+        axis.title = element_text(size = 13, color = "Black"),
+        axis.text = element_text(size = 13, color = "Black")) +
+  scale_color_grey(limits = c("Full Haar", "60% Haar", "30% Haar", "15% Haar",
+                              "8.0% Haar", "4.0% Haar", "2.0% Haar", 
+                              "1.0% Haar", "0.5% Haar")) +
+  #scale_x_reverse() +
+  guides(linetype = "none", color = 
+           guide_legend(nrow = 2, override.aes = list(shape = NA)))
+
+print(All_BT_scan_plot)
+
+# Saving reverse Haar NIR scan plot
+ggsave("All_levels_RevHaar_NIR_plot_20260109.png", width = 8, height = 4,
+       path = fig_dir, dpi = 300, units = "in")
+
+```
+
+## NIR scan, Haar transformed scan, and back-transformed scan figure
+
+Arranged figure with all scan plots for NIR scan 36035_5786_3.
+
+```{r arrang_NIR_scans_fig}
+
+# Arrange NIR, Haar, and full back-transform scan plots into a 3 column figure
+reg <- ggarrange(NIR_scan_plot, H_NIR_scan_plot, ncol = 2, 
+          labels = c("a", "b"))
+
+# Arrange 3 column figure into 2 rows, with back-transformed figure
+ggarrange(reg, All_BT_scan_plot, nrow = 2, 
+          labels = c("", "c"))
+
+# Saving arrangement of NIR, Haar, and reverse Haar scan plots
+ggsave("NIRHaarRHaar_plots_EDITS_20260109.png", width = 9, height = 9,
+       path = fig_dir, dpi = 300, units = "in")
+
+```
+
+# Near-infrared compression versus accuracy investigation & Dry NIR cal/val
+
+Running PLSR and Cubist models with un-transformed and Haar transformed NIR 
+signals and calculating performance metrics. The 50 samples that overlap with
+wet NIR data were removed.
+
+```{r NIR_tradeoff}
+
+if(!file.exists(file.path(results_dir, 'NIR_tradeoff_20251117.csv'))){
+  
+  # Remove subset of samples in wet data from NIR spectra
+  NIR_spectra_full <- NIR_spectra %>%
+    # Removing 50 samples from wet NIR data to ensure independence in model 
+    # ...training and prediction (from 8095 to 7788 observations, removing 307)
+    filter(!kssl_id %in% wet_train_data$SAMPLE_ID)
+  
+  # Remove subset of samples in wet data from Haar transformed NIR spectra
+  Haar_NIR_full <- Haar_NIR %>%
+    separate(sample_id, sep = "_", c("kssl_id", NA), remove = F) %>%
+    # Removing 50 samples from wet NIR data to ensure independence in model 
+    # ...training and prediction (from 8095 to 7788 observations, removing 307)
+    filter(!kssl_id %in% wet_train_data$SAMPLE_ID)
+  
+  set.seed(222)
+  
+  # For loops for data, property, and energy selections for PLSR below
+  performance_metrics_NIR_tradeoff <- data.frame()
+  all.PLSR.nir.predictions <- data.frame()
+  all.Cubist.nir.predictions <- data.frame()
+  plsr.coef <- list()
+  for(signal in c('NIR', 'Haar')){
+    for(var_name in c('OC_log', 'Clay_log', 'pH_log')){ #'OC', 
+    for(signal_compression in 0:8){
+      
+      new_data <- make_ML_data(variable_name = var_name, signal_data = signal, 
+                               Haar_compression_fold = signal_compression, 
+                               Lab_data = NIR_Lab_data, 
+                               spectra = NIR_spectra_full, 
+                               Haar_spectra = Haar_NIR_full)
+      
+      for(for_rep in 1:30){
+        
+        #signal <- 'MIR'
+        #var_name <- 'pH'
+        #signal_compression <- 0
+        
+        # Skips compression for NIR
+        if(signal == 'NIR' & signal_compression != 0){
+          next
+        }
+        
+        # Preparing for PLSR
+        ## Beginning of tic/toc for run timing and future comparisons
+        tic <- Sys.time()
+        
+        ## Selecting component count as either 20 or number of component columns 
+        ## ...in data
+        # We do not have 20 components here: how many independent variables in 
+        # ...the data frame that we are using for the prediction
+        component_count <- min(20, ncol(new_data$data)-3)
+        
+        ## Splitting data with 80% (4/5) going to training set
+        data_split <- group_initial_split(new_data$data, prop = 4/5,
+                                          group = kssl_id)
+        
+        # Model Calibration
+        ## Assigning calibration data
+        train_data <- training(data_split)
+        
+        ## Setting tidymodels workflow
+        recipe_train <- train_data %>%
+          # Is it okay to remove kssl_id (grouping variable) at this point?
+          select(-kssl_id) %>%
+          recipe() %>%
+          update_role(everything()) %>%
+          update_role(c("sample_id"), new_role = "id variable") %>%
+          update_role(new_data$metaData$variable, new_role = "outcome") %>%
+          prep()
+        
+        ## PLSR calibration
+        pls.model <- plsr(target ~ spectra, 
+                          data = list(target = juice(recipe_train, 
+                                                     composition = "matrix",
+                                                     all_outcomes()), 
+                                      spectra = juice(recipe_train, 
+                                                      composition = "matrix",
+                                                      all_predictors())),
+                          ncomp = component_count, scale = FALSE, center = FALSE)
+        #gc()
+        
+        ## Saving PLSR model
+        saveRDS(pls.model, file.path(models_dir, paste0(var_name,
+                                                        signal_compression,
+                                                        signal,
+                                                        for_rep,
+                                                        "full_NIR_dry_train_PLSR.rds", 
+                                                        collapse = "_")))
+        
+        plsr.coef[[sprintf('%s_%s_%s', signal, var_name, signal_compression)]] <- pls.model$coefficients
+        
+        # Cubist calibration
+        cubist.model <- cubist(y = juice(recipe_train, 
+                                         composition = "matrix", 
+                                         all_outcomes()), 
+                               x = juice(recipe_train, 
+                                         composition = "matrix",
+                                         all_predictors()), 
+                               committees = 5, neighbors = 0)
+        
+        ## Saving Cubist model
+        saveRDS(cubist.model, file.path(models_dir, paste0(var_name,
+                                                           signal_compression,
+                                                           signal,
+                                                           for_rep,
+                                                           "full_NIR_dry_train_Cubist.rds", 
+                                                           collapse = "_")))
+        
+        # Model validation
+        ## Setting tidymodels workflow
+        test_data  <- testing(data_split)
+        
+        recipe_test <- test_data %>%
+          select(-kssl_id) %>%
+          recipe() %>%
+          update_role(everything()) %>%
+          update_role(c("sample_id"), new_role = "id variable") %>%
+          update_role(new_data$metaData$variable, new_role = "outcome") %>%
+          prep()
+        
+        ## PLSR validation
+        nir.PLSR.predictions <- predict(pls.model, ncomp = component_count, 
+                                        newdata = list(target = juice(recipe_test, composition = "matrix", all_outcomes()), 
+                                                       spectra = juice(recipe_test, composition = "matrix", all_predictors()))) %>%
+          as.data.frame() %>%
+          setNames('plsr_prediction') %>%
+          bind_cols(test_data %>% 
+                      select(all_of(new_data$metaData$variable), sample_id))
+        
+        names(nir.PLSR.predictions) <- c('predicted', 'measured', 'sample_id')
+        
+        # Saving all PLSR predicted values for all reps and loops to evaluate 
+        # ...spread of data without effects of linear regression
+        all.PLSR.nir.predictions <- bind_rows(all.PLSR.nir.predictions,
+                                              c(nir.PLSR.predictions,
+                                                new_data$metaData,
+                                                list(rep = for_rep)))
+        
+        # Cubist validation
+        cubist_pred_data <- juice(recipe_test, 
+                                  composition = "matrix", all_outcomes()) %>% 
+          cbind(juice(recipe_test, 
+                      composition = "matrix",
+                      all_predictors()))
+        
+        nir.Cubist.predictions <- predict(cubist.model, 
+                                          newdata = cubist_pred_data, 
+                                          neighbors = 0) %>%
+          as.data.frame() %>%
+          setNames('cubist_prediction') %>%
+          bind_cols(test_data %>% 
+                      select(all_of(new_data$metaData$variable), sample_id))
+        
+        names(nir.Cubist.predictions) <- c('predicted', 'measured', 'sample_id')
+        
+        # Saving all Cubist predictions
+        all.Cubist.nir.predictions <- bind_rows(all.Cubist.nir.predictions,
+                                                c(nir.Cubist.predictions,
+                                                  new_data$metaData,
+                                                  list(rep = for_rep)))
+        
+        if(!grepl('_log', var_name)){
+          nir.PLSR.predictions <- nir.PLSR.predictions %>%
+            mutate(predicted = log(predicted),
+                   measured = log(measured))
+        }
+        
+        # Evaluation of model performance
+        ## Plot of predicted vs estimated values
+        
+        if(for_rep == 1){
+          
+          ggplot(nir.PLSR.predictions,
+                 aes(x = measured, 
+                     y = predicted)) +
+            geom_hex()  +
+            geom_abline(color = 'red') +
+            labs(x = 'Estimated', 
+                 y = 'Predicted',
+                 title = paste(new_data$metaData$variable, new_data$metaData$signal, 
+                               'at energy', new_data$metaData$energy)) +
+            theme_bw() +
+            theme(panel.background = element_blank(),
+                  panel.grid.major = element_blank(),
+                  axis.title = element_text(size = 13, color = "Black"),
+                  axis.text = element_text(size = 13, color = "Black"),
+                  panel.grid.minor = element_blank())
+          
+          ggsave(sprintf("%s_%s_%s_pred_calc_figure_NIR_tradeoff.png", 
+                         new_data$metaData$variable, 
+                         new_data$metaData$signal, 
+                         new_data$metaData$signal_compression), 
+                 width = 6, height = 6, 
+                 path = fig_dir, dpi = 300, units = "in")
+          
+        }
+        
+        ## Linear regression
+        PLSR_reg <- lm(formula = predicted ~ measured,
+                       data = nir.PLSR.predictions)
+        
+        Cubist_reg <- lm(formula = predicted ~ measured,
+                         data = nir.Cubist.predictions)
+        
+        ## RMSE calculation
+        PLSR_RMSE <- with(nir.PLSR.predictions, 
+                          sqrt(sum((predicted - measured)^2, na.rm=TRUE) / 
+                                 sum(is.finite(measured + predicted))))
+        
+        Cubist_RMSE <- with(nir.Cubist.predictions, 
+                            sqrt(sum((predicted - measured)^2, na.rm=TRUE) / 
+                                   sum(is.finite(measured + predicted))))
+        
+        ## Lin's CCC calculation
+        PLSR_LCCC <- ccc(data = nir.PLSR.predictions, truth = measured, 
+                         estimate = predicted)
+        
+        Cubist_LCCC <- ccc(data = nir.Cubist.predictions, truth = measured, 
+                           estimate = predicted)
+        
+        ## RPIQ calculation
+        PLSR_RPIQ <- rpiq(data = nir.PLSR.predictions, truth = measured, 
+                          estimate = predicted)
+        
+        Cubist_RPIQ <- rpiq(data = nir.Cubist.predictions, truth = measured, 
+                            estimate = predicted)
+        
+        ## End of tic/toc for run timing and future comparisons
+        toc <- Sys.time() - tic
+        print(toc)
+        
+        ## Adding performance metrics to performance_metrics df
+        performance_metrics_NIR_tradeoff <- bind_rows(performance_metrics_NIR_tradeoff,
+                                                      c(new_data$metaData, 
+                                                        list(P.RMSE = PLSR_RMSE, 
+                                                             P.LCCC = PLSR_LCCC$.estimate,
+                                                             P.RPIQ = PLSR_RPIQ$.estimate,
+                                                             P.lm_p = glance(PLSR_reg)$p.value,
+                                                             P.lm_r2 = glance(PLSR_reg)$r.squared, 
+                                                             P.lm_intercept= tidy(PLSR_reg)$estimate[1],
+                                                             P.lm_slope = tidy(PLSR_reg)$estimate[2], 
+                                                             C.RMSE = Cubist_RMSE, 
+                                                             C.LCCC = Cubist_LCCC$.estimate,
+                                                             C.RPIQ = Cubist_RPIQ$.estimate,
+                                                             C.lm_p = glance(Cubist_reg)$p.value,
+                                                             C.lm_r2 = glance(Cubist_reg)$r.squared, 
+                                                             C.lm_intercept= tidy(Cubist_reg)$estimate[1],
+                                                             C.lm_slope = tidy(Cubist_reg)$estimate[2], 
+                                                             runtime = format(toc, units = 'secs'), 
+                                                             rep = for_rep,
+                                                             objectsize = format(object.size(new_data), units = "Mb"))))
+        
+        
+      }
+    }
+    }
+  }
+  
+  ## Write performance metrics matrix to a csv
+  write_csv(performance_metrics_NIR_tradeoff, file.path(results_dir,
+                                                        "NIR_tradeoff_20251117.csv"))
+  
+  ## Write all PLSR predictions to a csv
+  write_csv(all.PLSR.nir.predictions, file.path(results_dir,
+                                                "PLSR_NIRtradeoff_preds_20251117.csv"))
+  
+  ## Write all Cubist predictions to a csv
+  write_csv(all.Cubist.nir.predictions, file.path(results_dir,
+                                                  "Cubist_NIRtradeoff_preds_20251117.csv"))
+  
+}
+
+performance_metrics_NIR_tradeoff <- read_csv(file.path(results_dir,
+                                                   "NIR_tradeoff_20251117.csv"))
+
+```
+
+Histogram of performance metrics for NIR and Haar cal/val results.
+
+```{r histogram_NIR_Haar_metrics}
+
+# Arranging NIR trade-off results for metrics histogram
+NIR_Haar_metrics.df <- performance_metrics_NIR_tradeoff %>%
+  pivot_longer(cols = -c(variable, signal, signal_compression, runtime, rep, 
+                         objectsize), names_to = "metric", 
+               values_to = "performance") %>%
+  mutate(model = case_when(startsWith(metric, "P") ~ 'PLSR', 
+                           TRUE ~ 'Cubist')) %>%
+  mutate(metric = gsub('^P.', '', metric),
+         metric = gsub('^C.', '', metric),
+         metric = gsub('lm_intercept', 'Intercept', metric),
+         metric = gsub('lm_slope', 'Slope', metric),
+         metric = gsub('lm_p', 'P-value', metric),
+         metric = gsub('lm_r2', 'R squared', metric),
+         metric = gsub('LCCC', "Lin's CCC", metric),
+         #metric = gsub('runtime', "Runtime", metric),
+         variable = gsub('Clay_log', 'Clay [log(%Clay)]', variable),
+         variable = gsub('OC_log', 'OC [log(%OC)]', variable),
+         variable = gsub('pH_log', 'pH-H2O', variable))
+
+# NIR and Haar model cal/val metrics histogram figure
+ggplot(data = NIR_Haar_metrics.df %>%
+         filter(metric %in% c("R squared", "Lin's CCC", "RMSE", "RPIQ",
+                              "Slope", "Intercept"))) +
+  geom_histogram(aes(x = performance)) +
+  facet_wrap(variable ~ metric , scales = "free", ncol = 6) +
+  labs(x = "Performance Metric Value", y = "") +
+  theme(panel.grid.minor = element_blank(),
+        axis.title.y = element_blank(),
+        axis.title = element_text(size = 13, color = "Black"),
+        axis.text = element_text(size = 13, color = "Black"),
+        strip.background =element_rect(fill="white"),
+        strip.text.x = element_text(size = 13, color = "Black"))
+
+# Saving NIR and Haar model cal/val metrics histogram figure
+ggsave("NIR_Haar_ModelVal_perf_hist_20251203.png", width = 15, height = 12, 
+       path = fig_dir, dpi = 300, units = "in")
+
+```
+
+##  Train and validate dry subset model through Haar levels
+
+Running PLSR and Cubist models for the subset of dry samples used for the wet 
+scans, with un-transformed and Haar transformed NIR signals and calculating performance metrics.
+
+```{r subset_NIR_tradeoff}
+
+if(!file.exists(file.path(results_dir, 'subset_NIR_tradeoff_20251114.csv'))){
+  
+  # Remove subset of samples in wet data from NIR spectra
+  NIR_spectra_sub <- NIR_spectra %>%
+    # Removing 50 samples from wet NIR data to ensure independence in model 
+    # ...training and prediction (from 8095 to 7788 observations, removing 307)
+    filter(kssl_id %in% wet_train_data$SAMPLE_ID)
+  
+  # Remove subset of samples in wet data from Haar transformed NIR spectra
+  Haar_NIR_sub <- Haar_NIR %>%
+    separate(sample_id, sep = "_", c("kssl_id", NA), remove = F) %>%
+    # Removing 50 samples from wet NIR data to ensure independence in model 
+    # ...training and prediction (from 8095 to 7788 observations, removing 307)
+    filter(kssl_id %in% wet_train_data$SAMPLE_ID)
+    
+  set.seed(222)
+  
+  # For loops for data, property, and energy selections for PLSR below
+  performance_metrics_NIR_tradeoff <- data.frame()
+  all.PLSR.nir.predictions <- data.frame()
+  all.Cubist.nir.predictions <- data.frame()
+  plsr.coef <- list()
+  for(signal in c('NIR', 'Haar')){
+    for(var_name in c('OC_log', 'Clay_log', 'pH_log')){ #'OC', 
+    for(signal_compression in 0:8){
+      
+      new_data <- make_ML_data(variable_name = var_name, signal_data = signal, 
+                               Haar_compression_fold = signal_compression, 
+                               Lab_data = NIR_Lab_data, 
+                               spectra = NIR_spectra_sub, 
+                               Haar_spectra = Haar_NIR_sub)
+      
+      for(for_rep in 1:30){
+        
+        #signal <- 'MIR'
+        #var_name <- 'pH'
+        #signal_compression <- 0
+        
+        if(signal == 'NIR' & signal_compression != 0){
+          next
+        }
+        
+        # Preparing for PLSR
+        ## Beginning of tic/toc for run timing and future comparisons
+        tic <- Sys.time()
+        
+        ## Selecting component count as either 20 or number of component columns 
+        ## ...in data
+        # We do not have 20 components here: how many independent variables in 
+        # ...the data frame that we are using for the prediction
+        component_count <- min(20, ncol(new_data$data)-3)
+        
+        ## Splitting data with 80% (4/5) going to training set
+        data_split <- group_initial_split(new_data$data, prop = 4/5,
+                                          group = kssl_id)
+        
+        # Model Calibration
+        ## Assigning calibration data
+        train_data <- training(data_split)
+        
+        ## Setting tidymodels workflow
+        recipe_train <- train_data %>%
+          # Is it okay to remove kssl_id (grouping variable) at this point?
+          select(-kssl_id) %>%
+          recipe() %>%
+          update_role(everything()) %>%
+          update_role(c("sample_id"), new_role = "id variable") %>%
+          update_role(new_data$metaData$variable, new_role = "outcome") %>%
+          prep()
+        
+        ## PLSR calibration
+        pls.model <- plsr(target ~ spectra, 
+                          data = list(target = juice(recipe_train, 
+                                                     composition = "matrix",
+                                                     all_outcomes()), 
+                                      spectra = juice(recipe_train, 
+                                                      composition = "matrix",
+                                                      all_predictors())),
+                          ncomp = component_count, scale = FALSE, center = FALSE)
+        #gc()
+        
+        ## Saving PLSR model
+        saveRDS(pls.model, file.path(models_dir, 
+                                     paste0(var_name, signal_compression,
+                                            signal,
+                                            for_rep,
+                                            "subset_NIR_dry_train_PLSR.rds", 
+                                            collapse = "_")))
+        
+        plsr.coef[[sprintf('%s_%s_%s', signal, var_name, signal_compression)]] <- pls.model$coefficients
+        
+        # Cubist calibration
+        cubist.model <- cubist(y = juice(recipe_train, 
+                                         composition = "matrix", 
+                                         all_outcomes()), 
+                               x = juice(recipe_train, 
+                                         composition = "matrix",
+                                         all_predictors()), 
+                               committees = 5, neighbors = 0)
+        
+        ## Saving Cubist model
+        saveRDS(cubist.model, file.path(models_dir, 
+                                        paste0(var_name,
+                                               signal_compression,
+                                               signal,
+                                               for_rep,
+                                               "subset_NIR_dry_train_Cubist.rds", 
+                                               collapse = "_")))
+        
+        # Model validation
+        ## Setting tidymodels workflow
+        test_data  <- testing(data_split)
+        
+        recipe_test <- test_data %>%
+          # Is it okay to remove kssl_id (grouping variable) at this point?
+          select(-kssl_id) %>%
+          recipe() %>%
+          update_role(everything()) %>%
+          update_role(c("sample_id"), new_role = "id variable") %>%
+          update_role(new_data$metaData$variable, new_role = "outcome") %>%
+          prep()
+        
+        ## PLSR validation
+        nir.PLSR.predictions <- predict(pls.model, ncomp = component_count, 
+                                        newdata = list(target = juice(recipe_test, composition = "matrix", all_outcomes()), 
+                                                       spectra = juice(recipe_test, composition = "matrix", all_predictors()))) %>%
+          as.data.frame() %>%
+          setNames('plsr_prediction') %>%
+          bind_cols(test_data %>% 
+                      select(all_of(new_data$metaData$variable), sample_id))
+        
+        names(nir.PLSR.predictions) <- c('predicted', 'measured', 'sample_id')
+        
+        # Saving all PLSR predicted values for all reps and loops to evaluate 
+        # ...spread of data without effects of linear regression
+        all.PLSR.nir.predictions <- bind_rows(all.PLSR.nir.predictions,
+                                              c(nir.PLSR.predictions,
+                                                new_data$metaData,
+                                                list(rep = for_rep)))
+        
+        # Cubist validation
+        cubist_pred_data <- juice(recipe_test, 
+                                  composition = "matrix", all_outcomes()) %>% 
+          cbind(juice(recipe_test, 
+                      composition = "matrix",
+                      all_predictors()))
+        
+        nir.Cubist.predictions <- predict(cubist.model, 
+                                          newdata = cubist_pred_data, 
+                                          neighbors = 0) %>%
+          as.data.frame() %>%
+          setNames('cubist_prediction') %>%
+          bind_cols(test_data %>% 
+                      select(all_of(new_data$metaData$variable), sample_id))
+        
+        names(nir.Cubist.predictions) <- c('predicted', 'measured', 'sample_id')
+        
+        # Saving all Cubist predictions
+        all.Cubist.nir.predictions <- bind_rows(all.Cubist.nir.predictions,
+                                                c(nir.Cubist.predictions,
+                                                  new_data$metaData,
+                                                  list(rep = for_rep)))
+        
+        if(!grepl('_log', var_name)){
+          nir.PLSR.predictions <- nir.PLSR.predictions %>%
+            mutate(predicted = log(predicted),
+                   measured = log(measured))
+        }
+        
+        # Evaluation of model performance
+        ## Plot of predicted vs estimated values
+        
+        if(for_rep == 1){
+          
+          ggplot(nir.PLSR.predictions,
+                 aes(x = measured, 
+                     y = predicted)) +
+            geom_hex()  +
+            geom_abline(color = 'red') +
+            labs(x = 'Estimated', 
+                 y = 'Predicted',
+                 title = paste(new_data$metaData$variable, new_data$metaData$signal, 
+                               'at energy', new_data$metaData$energy)) +
+            theme_bw() +
+            theme(panel.background = element_blank(),
+                  panel.grid.major = element_blank(),
+                  axis.title = element_text(size = 13, color = "Black"),
+                  axis.text = element_text(size = 13, color = "Black"),
+                  panel.grid.minor = element_blank())
+          
+          ggsave(sprintf("%s_%s_%s_pred_calc_figure_NIR_tradeoff.png", 
+                         new_data$metaData$variable, 
+                         new_data$metaData$signal, 
+                         new_data$metaData$signal_compression), 
+                 width = 6, height = 6, 
+                 path = fig_dir, dpi = 300, units = "in")
+          
+        }
+        
+        ## Linear regression
+        PLSR_reg <- lm(formula = predicted ~ measured,
+                       data = nir.PLSR.predictions)
+        
+        Cubist_reg <- lm(formula = predicted ~ measured,
+                         data = nir.Cubist.predictions)
+        
+        ## RMSE calculation
+        PLSR_RMSE <- with(nir.PLSR.predictions, 
+                          sqrt(sum((predicted - measured)^2, na.rm=TRUE) / 
+                                 sum(is.finite(measured + predicted))))
+        
+        Cubist_RMSE <- with(nir.Cubist.predictions, 
+                            sqrt(sum((predicted - measured)^2, na.rm=TRUE) / 
+                                   sum(is.finite(measured + predicted))))
+        
+        ## Lin's CCC calculation
+        PLSR_LCCC <- ccc(data = nir.PLSR.predictions, truth = measured, 
+                         estimate = predicted)
+        
+        Cubist_LCCC <- ccc(data = nir.Cubist.predictions, truth = measured, 
+                           estimate = predicted)
+        
+        ## RPIQ calculation
+        PLSR_RPIQ <- rpiq(data = nir.PLSR.predictions, truth = measured, 
+                          estimate = predicted)
+        
+        Cubist_RPIQ <- rpiq(data = nir.Cubist.predictions, truth = measured, 
+                            estimate = predicted)
+        
+        ## End of tic/toc for run timing and future comparisons
+        toc <- Sys.time() - tic
+        print(toc)
+        
+        ## Adding performance metrics to performance_metrics df
+        performance_metrics_NIR_tradeoff <- bind_rows(performance_metrics_NIR_tradeoff,
+                                                      c(new_data$metaData, 
+                                                        list(P.RMSE = PLSR_RMSE, 
+                                                             P.LCCC = PLSR_LCCC$.estimate,
+                                                             P.RPIQ = PLSR_RPIQ$.estimate,
+                                                             P.lm_p = glance(PLSR_reg)$p.value,
+                                                             P.lm_r2 = glance(PLSR_reg)$r.squared, 
+                                                             P.lm_intercept= tidy(PLSR_reg)$estimate[1],
+                                                             P.lm_slope = tidy(PLSR_reg)$estimate[2], 
+                                                             C.RMSE = Cubist_RMSE, 
+                                                             C.LCCC = Cubist_LCCC$.estimate,
+                                                             C.RPIQ = Cubist_RPIQ$.estimate,
+                                                             C.lm_p = glance(Cubist_reg)$p.value,
+                                                             C.lm_r2 = glance(Cubist_reg)$r.squared, 
+                                                             C.lm_intercept= tidy(Cubist_reg)$estimate[1],
+                                                             C.lm_slope = tidy(Cubist_reg)$estimate[2], 
+                                                             runtime = format(toc, units = 'secs'), 
+                                                             rep = for_rep,
+                                                             objectsize = format(object.size(new_data), units = "Mb"))))
+        
+        
+      }
+    }
+    }
+  }
+  
+  ## Write performance metrics matrix to a csv
+  write_csv(performance_metrics_NIR_tradeoff, 
+            file.path(results_dir,
+                      "subset_NIR_tradeoff_20251114.csv"))
+  
+  ## Write all PLSR predictions to a csv
+  write_csv(all.PLSR.nir.predictions, 
+            file.path(results_dir,
+                      "subset_PLSR_NIRtradeoff_preds_20251114.csv"))
+  
+  ## Write all Cubist predictions to a csv
+  write_csv(all.Cubist.nir.predictions, 
+            file.path(results_dir,
+                      "subset_Cubist_NIRtradeoff_preds_20251114.csv"))
+  
+}
+
+performance_metrics_subset_NIR_tradeoff <- read_csv(file.path(
+  results_dir, "subset_NIR_tradeoff_20251114.csv"))
+
+```
+
+Histogram of performance metrics for subset dry model calibrated dry subset
+validated NIR scans.
+
+```{r NIR_hist_subsetdry_metrics}
+
+# Arranging NIR trade-off results for metrics histogram
+NIR_subdry_model_metrics.df <- performance_metrics_subset_NIR_tradeoff %>%
+  pivot_longer(cols = -c(variable, signal, signal_compression, runtime, rep, 
+                         objectsize), 
+               names_to = "metric", 
+               values_to = "performance") %>%
+  mutate(model = case_when(startsWith(metric, "P") ~ 'PLSR', 
+                           TRUE ~ 'Cubist')) %>%
+  mutate(metric = gsub('^P.', '', metric),
+         metric = gsub('^C.', '', metric),
+         metric = gsub('lm_intercept', 'Intercept', metric),
+         metric = gsub('lm_slope', 'Slope', metric),
+         metric = gsub('lm_p', 'P-value', metric),
+         metric = gsub('lm_r2', 'R squared', metric),
+         metric = gsub('LCCC', "Lin's CCC", metric),
+         #metric = gsub('runtime', "Runtime", metric),
+         variable = gsub('Clay_log', 'Clay [log(%Clay)]', variable),
+         variable = gsub('OC_log', 'OC [log(%OC)]', variable),
+         variable = gsub('pH_log', 'pH-H2O', variable))
+
+# NIR and Haar model cal/val metrics histogram figure
+ggplot(data = NIR_subdry_model_metrics.df %>%
+         filter(metric %in% c("R squared", "Lin's CCC", "RMSE", "RPIQ",
+                              "Slope", "Intercept"))) +
+  geom_histogram(aes(x = performance)) +
+  facet_wrap(variable ~ metric , scales = "free", ncol = 6) +
+  labs(x = "Performance Metric Value", y = "") +
+  theme(panel.grid.minor = element_blank(),
+        axis.title.y = element_blank(),
+        axis.title = element_text(size = 13, color = "Black"),
+        axis.text = element_text(size = 13, color = "Black"),
+        strip.background =element_rect(fill="white"),
+        strip.text.x = element_text(size = 13, color = "Black"))
+
+# Saving NIR and Haar model cal/val metrics histogram figure
+ggsave("SubdryNIR_ModelVal_perf_hist_20251203.png", width = 15, height = 12, 
+       path = fig_dir, dpi = 300, units = "in")
+
+```
+
+# Wet NIR data
+
+Plotting out wet lab data.
+
+```{r wet_lab_data}
+
+NIR_wet_hist.df <- wet_Lab_data %>%
+  select(-c(OC_log, Clay_log)) %>%
+  rename("Clay (%)" = Clay,
+         "OC (%)" = OC,
+         "pH-H2O" = pH_log)
+
+ggplot(data = NIR_wet_hist.df %>%
+         pivot_longer(cols = -sample_id)) +
+  geom_histogram(aes(x = value)) +
+  facet_wrap(~ name, scales = "free_x") +
+  labs(x = "Property Value", y = "Distribution") +
+  theme(panel.grid.minor = element_blank(),
+        axis.title = element_text(size = 13, color = "Black"),
+        axis.text = element_text(size = 13, color = "Black"),
+        strip.background =element_rect(fill="white"),
+        strip.text.x = element_text(size = 13, color = "Black"))
+
+# Saving golden dry NIR property histogram figure
+ggsave("wetNIR_prop_hist_20251118.png", width = 9, height = 4, 
+       path = fig_dir, dpi = 300, units = "in")
+
+```
+
+##  Train and validate wet NIR model
+
+Train and validate wet model using wet lab and NIR data.
+
+```{r wet_NIR_cal_val}
+
+if(!file.exists(file.path(results_dir, 
+                          'NIR_wet_train_results_20251117.csv'))){
+  
+  # For loops for data, property, and energy selections for PLSR below
+  performance_metrics_wet_NIR <- data.frame()
+  all.plsr.wet.predictions <- data.frame()
+  all.wet.cubist.predictions <- data.frame()
+  plsr.coef <- list()
+  
+  ## Setting seed for random selection in calibration/validation split
+  set.seed(222)
+  
+  for(var_name in c('OC_log', 'pH_log', 'Clay_log')){
+    
+    for(for_rep in 1:30){
+      
+      new_data <- list(data = wet_train_data %>%
+                         select(sample_id, SAMPLE_ID, all_of(var_name), 
+                                matches('^\\d+$')),
+                       metaData = list(variable = var_name, 
+                                       signal = 'nir', 
+                                       Haar_compression_fold = 'NA'))
+      
+      # Preparing for PLSR
+      ## Beginning of tic/toc for run timing and future comparisons
+      tic <- Sys.time()
+      
+      ## Selecting component count as either 20 or number of component columns 
+      ## ...in data
+      # We do not have 20 components here: how many independent variables in 
+      # ...the data frame that we are using for the prediction
+      component_count <- min(20, ncol(new_data$data)-3)
+      
+      ## Splitting data with 80% (4/5) going to training set
+      data_split <- group_initial_split(new_data$data, prop = 4/5,
+                                        group = SAMPLE_ID)
+      
+      # Model Calibration
+      ## Assigning calibration data
+      train_data <- training(data_split)
+      
+      ## Setting tidymodels workflow
+      recipe_train <- train_data %>%
+        select(-SAMPLE_ID) %>%
+        recipe() %>%
+        update_role(everything()) %>%
+        update_role(c("sample_id"), new_role = "id variable") %>%
+        update_role(new_data$metaData$variable, new_role = "outcome") %>%
+        prep()
+      
+      ## PLSR calibration
+      pls.model.wet.nir <- plsr(target ~ spectra, 
+                                data = list(target = juice(recipe_train, 
+                                                           composition = "matrix",
+                                                           all_outcomes()), 
+                                            spectra = juice(recipe_train, 
+                                                            composition = "matrix",
+                                                            all_predictors())),
+                                ncomp = component_count, scale = FALSE, center = FALSE)
+      
+      if(for_rep == 1){
+        
+        saveRDS(pls.model.wet.nir, 
+                file.path(models_dir, paste0(var_name, for_rep, 
+                                             "NIR_wet_PLSR.rds", 
+                                                                collapse = "_")))
+        
+      }
+      
+      plsr.coef[[sprintf('%s_%s_%s', new_data$metaData$signal, 
+                         var_name, 'NA')]] <- pls.model.wet.nir$coefficients
+      
+      ## Cubist calibration
+      cubist.model.wet <- cubist(y = juice(recipe_train, 
+                                           composition = "matrix", 
+                                           all_outcomes()), 
+                                 x = juice(recipe_train, 
+                                           composition = "matrix",
+                                           all_predictors()), 
+                                 committees = 5, neighbors = 0)
+      
+      # Saving Cubist model for first run in the 30 run rep
+      if(for_rep == 1){
+        
+        saveRDS(cubist.model.wet, file.path(models_dir, paste0(var_name, for_rep,
+                                                               "NIR_wet_Cubist.rds", 
+                                                               collapse = "_")))
+        
+      }
+      
+      # Model validation
+      ## Setting tidymodels workflow
+      test_data  <- testing(data_split)
+      recipe_test <- test_data %>%
+        select(-SAMPLE_ID) %>%
+        recipe() %>%
+        update_role(everything()) %>%
+        update_role(c("sample_id"), new_role = "id variable") %>%
+        update_role(new_data$metaData$variable, new_role = "outcome") %>%
+        prep()
+      
+      ## PLSR Validation
+      pls.model.nir.predictions <- predict(pls.model.wet.nir, ncomp = component_count, 
+                                           newdata = list(#target = juice(recipe_test, composition = "matrix", all_outcomes()), 
+                                             spectra = juice(recipe_test, composition = "matrix", all_predictors()))) %>%
+        as.data.frame() %>%
+        setNames('plsr_prediction') %>%
+        bind_cols(test_data %>% 
+                    select(all_of(new_data$metaData$variable), sample_id))
+      
+      names(pls.model.nir.predictions) <- c('predicted', 'measured', 'sample_id')
+      
+      # Saving all predicted values for all reps and loops to evaluate spread of 
+      # ...data without effects of linear regression
+      all.plsr.wet.predictions <- bind_rows(all.plsr.wet.predictions,
+                                            c(pls.model.nir.predictions,
+                                              new_data$metaData,
+                                              list(rep = for_rep)))
+      
+      ## Cubist validation
+      cubist_pred_data <- juice(recipe_test, 
+                                composition = "matrix", all_outcomes()) %>% 
+        cbind(juice(recipe_test, 
+                    composition = "matrix",
+                    all_predictors()))
+      
+      wet.Cubist.predictions <- predict(cubist.model.wet, 
+                                        newdata = cubist_pred_data, 
+                                        neighbors = 0) %>%
+        as.data.frame() %>%
+        setNames('cubist_prediction') %>%
+        bind_cols(test_data %>% 
+                    select(all_of(new_data$metaData$variable), sample_id))
+      
+      names(wet.Cubist.predictions) <- c('predicted', 'measured', 'sample_id')
+      
+      # Saving all predicted values from Cubist model
+      all.wet.cubist.predictions <- bind_rows(all.wet.cubist.predictions,
+                                            c(wet.Cubist.predictions,
+                                              new_data$metaData,
+                                              list(rep = for_rep)))
+      
+      if(!grepl('_log', var_name)){
+        pls.model.nir.predictions <- pls.model.nir.predictions %>%
+          mutate(predicted = log(predicted),
+                 measured = log(measured))
+      }
+      
+      # Evaluation of model performance
+      ## Plot of predicted vs estimated values
+      
+      if(for_rep == 1){
+        
+        ggplot(pls.model.nir.predictions,
+               aes(x = measured, 
+                   y = predicted)) +
+          geom_hex()  +
+          geom_abline(color = 'red') +
+          labs(x = 'Estimated', 
+               y = 'Predicted',
+               title = paste(new_data$metaData$variable, new_data$metaData$signal, 
+                             'at energy', new_data$metaData$energy)) +
+          theme_bw() +
+          theme(panel.background = element_blank(),
+                panel.grid.major = element_blank(),
+                axis.title = element_text(size = 13, color = "Black"),
+                axis.text = element_text(size = 13, color = "Black"),
+                panel.grid.minor = element_blank())
+        
+        ggsave(sprintf("%s_%s_%s_pred_calc_figure_NIR_wet.png", 
+                       new_data$metaData$variable, 
+                       new_data$metaData$signal, 
+                       new_data$metaData$Haar_compression_fold), 
+               width = 6, height = 6, 
+               path = fig_dir, dpi = 300, units = "in")
+        
+      }
+      
+      
+      ## Linear regression
+      PLSR_reg <- lm(formula = predicted ~ measured,
+                     data = pls.model.nir.predictions)
+      
+      Cubist_reg <- lm(formula = predicted ~ measured,
+                       data = wet.Cubist.predictions)
+      
+      ## RMSE calculation
+      PLSR_RMSE <- with(pls.model.nir.predictions, 
+                        sqrt(sum((predicted - measured)^2, na.rm=TRUE) / 
+                               sum(is.finite(measured + predicted))))
+      
+      Cubist_RMSE <- with(wet.Cubist.predictions, 
+                          sqrt(sum((predicted - measured)^2, na.rm=TRUE) / 
+                                 sum(is.finite(measured + predicted))))
+      
+      ## Lin's CCC calculation
+      PLSR_LCCC <- ccc(data = pls.model.nir.predictions, truth = measured, 
+                       estimate = predicted)
+      
+      Cubist_LCCC <- ccc(data = wet.Cubist.predictions, truth = measured, 
+                         estimate = predicted)
+      
+      ## RPIQ calculation
+      PLSR_RPIQ <- rpiq(data = pls.model.nir.predictions, truth = measured, 
+                        estimate = predicted)
+      
+      Cubist_RPIQ <- rpiq(data = wet.Cubist.predictions, truth = measured, 
+                          estimate = predicted)
+      
+      ## End of tic/toc for run timing and future comparisons
+      toc <- Sys.time() - tic
+      print(toc)
+      
+      ## Adding performance metrics to performance_metrics df
+      performance_metrics_wet_NIR <- bind_rows(performance_metrics_wet_NIR,
+                                               c(new_data$metaData, 
+                                                 list(P.RMSE = PLSR_RMSE, 
+                                                      P.LCCC = PLSR_LCCC$.estimate,
+                                                      P.RPIQ = PLSR_RPIQ$.estimate,
+                                                      P.lm_p = glance(PLSR_reg)$p.value,
+                                                      P.lm_r2 = glance(PLSR_reg)$r.squared, 
+                                                      P.lm_intercept= tidy(PLSR_reg)$estimate[1],
+                                                      P.lm_slope = tidy(PLSR_reg)$estimate[2], 
+                                                      C.RMSE = Cubist_RMSE, 
+                                                      C.LCCC = Cubist_LCCC$.estimate,
+                                                      C.RPIQ = Cubist_RPIQ$.estimate,
+                                                      C.lm_p = glance(Cubist_reg)$p.value,
+                                                      C.lm_r2 = glance(Cubist_reg)$r.squared, 
+                                                      C.lm_intercept= tidy(Cubist_reg)$estimate[1],
+                                                      C.lm_slope = tidy(Cubist_reg)$estimate[2], 
+                                                      runtime = format(toc, units = 'secs'), 
+                                                      rep = for_rep,
+                                                      objectsize = format(object.size(new_data), units = "Mb"))))
+      
+    }
+  }
+  
+  ## Write performance metrics matrix to a csv
+  write_csv(performance_metrics_wet_NIR, file.path(results_dir, "NIR_wet_train_results_20251117.csv"))
+  
+  ## Write all PLSR predictions to a csv
+  write_csv(all.plsr.wet.predictions, file.path(results_dir,
+                                                "NIR_PLSR_wet_20251117.csv"))
+  
+  ## Write all Cubist predictions to a csv
+  write_csv(all.wet.cubist.predictions, file.path(results_dir,
+                                                  "NIR_Cubist_wet_20251117.csv"))
+  
+}
+
+performance_metrics_wet_NIR <- read_csv(file.path(results_dir, "NIR_wet_train_results_20251117.csv"))
+
+```
+
+Histogram of performance metrics for wet calibrated wet validated NIR scans.
+
+```{r NIR_hist_wetwet_metrics}
+
+# Arranging NIR trade-off results for metrics histogram
+NIR_wet_model_metrics.df <- performance_metrics_wet_NIR %>%
+  pivot_longer(cols = -c(variable, signal, runtime, rep, 
+                         objectsize, Haar_compression_fold), 
+               names_to = "metric", 
+               values_to = "performance") %>%
+  mutate(model = case_when(startsWith(metric, "P") ~ 'PLSR', 
+                           TRUE ~ 'Cubist')) %>%
+  mutate(metric = gsub('^P.', '', metric),
+         metric = gsub('^C.', '', metric),
+         metric = gsub('lm_intercept', 'intercept', metric),
+         metric = gsub('lm_slope', 'slope', metric),
+         metric = gsub('lm_p', 'P-value', metric),
+         metric = gsub('lm_r2', 'R squared', metric),
+         metric = gsub('LCCC', "Lin's CCC", metric),
+         #metric = gsub('runtime', "Runtime", metric),
+         variable = gsub('Clay_log', 'Clay [log(%Clay)]', variable),
+         variable = gsub('OC_log', 'OC [log(%OC)]', variable),
+         variable = gsub('pH_log', 'pH-H2O', variable))
+
+# NIR and Haar model cal/val metrics histogram figure
+ggplot(data = NIR_wet_model_metrics.df %>%
+         filter(metric %in% c("R squared", "Lin's CCC", "RMSE", "RPIQ"))) +
+  geom_histogram(aes(x = performance)) +
+  facet_wrap(variable ~ metric , scales = "free") +
+  labs(x = "Performance Metric Value", y = "") +
+  theme(panel.grid.minor = element_blank(),
+        axis.title.y = element_blank(),
+        axis.title = element_text(size = 13, color = "Black"),
+        axis.text = element_text(size = 13, color = "Black"),
+        strip.background =element_rect(fill="white"),
+        strip.text.x = element_text(size = 13, color = "Black"))
+
+# Saving NIR and Haar model cal/val metrics histogram figure
+ggsave("WetNIR_ModelVal_perf_hist_20251118.png", width = 12, height = 12, 
+       path = fig_dir, dpi = 300, units = "in")
+
+```
+
+# Using dry NIR model to predict OC from wet NIR scans
+
+Predicting wet OC using un-transformed dry NIR trained model.
+
+```{r NIR_dry_predict_wet}
+
+if(!file.exists(file.path(results_dir, 'wetdry_pred_results_20251117.csv'))){
+  
+  set.seed(222)
+  
+  performance_metrics_NIR_wet <- data.frame()
+  all.nir.plsr.drywet.pred <- data.frame()
+  all.nir.cubist.drywet.pred <- data.frame()
+  plsr.coef <- list()
+  
+  #for(signal in c('nir', 'Haar')){
+  for(var_name in c('OC_log', 'pH_log', 'Clay_log')){
+    
+    # Add for loop for CV and add an index into performance metrics to track which
+    # ...replicate it is (rep)
+    for (for_rep in 1:30) {
+      
+      
+      signal <- 'nir'
+      #var_name <- 'OC'  
+      signal_compression <- 0
+      
+      if(signal == 'nir' & signal_compression != 0){
+        next
+      }
+      
+      #new_data <- make_ML_data(variable_name = var_name, 
+      #                         signal_data = signal, 
+      #                         Haar_compression_fold = signal_compression)
+      
+      temp_property <- wet_Lab_data %>%
+        dplyr::select(sample_id, all_of(var_name))
+      
+      new_data <- list(data = temp_property %>%
+                         inner_join(wet_nir_spectra, by = "sample_id"),
+                       metaData = list(variable = var_name, 
+                                       signal = signal, 
+                                       Haar_compression_fold = 'NA'))
+      
+      rm(temp_property) # since large data
+      
+      # Preparing for PLSR
+      ## Beginning of tic/toc for run timing and future comparisons
+      tic <- Sys.time()
+      
+      ## Selecting component count as either 20 or number of component columns 
+      ## ...in data
+      # We do not have 20 components here: how many independent variables in 
+      # ...the data frame that we are using for the prediction
+      component_count <- min(20, ncol(new_data$data)-2)
+      
+      ## Setting seed for random selection in calibration/validation split
+      #set.seed(222) -> when do bootstraps, do not set random seed
+      
+      ## Splitting data with 80% (4/5) going to training set
+      data_split <- initial_split(new_data$data, prop = 4/5) # for bootstrapping
+      
+      # Model validation
+      ## Setting tidymodels workflow
+      test_data  <- testing(data_split)
+      recipe_test <- test_data %>%
+        recipe() %>%
+        update_role(everything()) %>%
+        update_role(c("sample_id"), new_role = "id variable") %>%
+        update_role(new_data$metaData$variable, new_role = "outcome") %>%
+        prep()
+      
+      ## PLSR predicting
+      NIR_dry_PLSR_model <- readRDS(file.path(models_dir, paste0(var_name,
+                                                           signal_compression,
+                                                           signal,
+                                                           for_rep,
+                                                          "full_NIR_dry_train_PLSR.rds",
+                                                                    collapse = "_")))
+      
+      pls.model.nir.predictions <- predict(NIR_dry_PLSR_model, ncomp = component_count, 
+                                           newdata = list(spectra = juice(recipe_test, composition = "matrix", all_predictors()))) %>%
+        as.data.frame() %>%
+        setNames('plsr_prediction') %>%
+        bind_cols(test_data %>% 
+                    select(all_of(new_data$metaData$variable), sample_id))
+      
+      names(pls.model.nir.predictions) <- c('predicted', 'measured', 'sample_id')
+      
+      # Saving all predicted values for all reps and loops to evaluate spread of 
+      # ...data without effects of linear regression
+      all.nir.plsr.drywet.pred <- bind_rows(all.nir.plsr.drywet.pred,
+                                               c(pls.model.nir.predictions,
+                                                 new_data$metaData,
+                                                 list(rep = for_rep)))
+      
+      ## Cubist predicting
+      NIR_dry_Cubist_model <- readRDS(file.path(models_dir, paste0(var_name,
+                                                           signal_compression,
+                                                           signal,
+                                                           for_rep,
+                                                          "full_NIR_dry_train_Cubist.rds",
+                                                                    collapse = "_")))
+      
+      cubist_pred_data <- cbind(x = juice(recipe_test, 
+                                composition = "matrix", all_outcomes()),
+        y = juice(recipe_test, 
+                    composition = "matrix",
+                    all_predictors()))
+      
+      cubist.model.nir.predictions <- predict(NIR_dry_Cubist_model, 
+                                        newdata = cubist_pred_data, 
+                                        neighbors = 0) %>%
+        as.data.frame() %>%
+        setNames('cubist_prediction') %>%
+        bind_cols(test_data %>% 
+                    select(all_of(new_data$metaData$variable), sample_id))
+      
+      names(cubist.model.nir.predictions) <- c('predicted', 'measured', 'sample_id')
+      
+      # Saving all predicted values for all reps and loops to evaluate spread of 
+      # ...data without effects of linear regression
+      all.nir.cubist.drywet.pred <- bind_rows(all.nir.cubist.drywet.pred,
+                                               c(cubist.model.nir.predictions,
+                                                 new_data$metaData,
+                                                 list(rep = for_rep)))
+      
+      if(!grepl('_log', var_name)){
+        pls.model.nir.predictions <- pls.model.nir.predictions %>%
+          mutate(predicted = log(predicted),
+                 measured = log(measured))
+      }
+      
+      # Evaluation of model performance
+      ## Plot of predicted vs estimated values
+      
+      if(for_rep == 1){
+        
+        ggplot(pls.model.nir.predictions,
+               aes(x = measured, 
+                   y = predicted)) +
+          geom_hex()  +
+          geom_abline(color = 'red') +
+          labs(x = 'Estimated', 
+               y = 'Predicted',
+               title = paste(new_data$metaData$variable, new_data$metaData$signal, 
+                             'at energy', new_data$metaData$energy)) +
+          theme_bw() +
+          theme(panel.background = element_blank(),
+                panel.grid.major = element_blank(),
+                axis.title = element_text(size = 13, color = "Black"),
+                axis.text = element_text(size = 13, color = "Black"),
+                panel.grid.minor = element_blank())
+        
+        ggsave(sprintf("%s_%s_%s_pred_calc_figure_NIR_drywet.png", 
+                       new_data$metaData$variable, 
+                       new_data$metaData$signal, 
+                       new_data$metaData$Haar_compression_fold), 
+               width = 6, height = 6, 
+               path = fig_dir, dpi = 300, units = "in")
+        
+      }
+      
+      
+      ## Linear regression
+      PLSR_reg <- lm(formula = predicted ~ measured,
+                     data = pls.model.nir.predictions)
+      
+      Cubist_reg <- lm(formula = predicted ~ measured,
+                       data = cubist.model.nir.predictions)
+      
+      ## RMSE calculation
+      PLSR_RMSE <- with(pls.model.nir.predictions, 
+                        sqrt(sum((predicted - measured)^2, na.rm=TRUE) / 
+                               sum(is.finite(measured + predicted))))
+      
+      Cubist_RMSE <- with(cubist.model.nir.predictions, 
+                          sqrt(sum((predicted - measured)^2, na.rm=TRUE) / 
+                                 sum(is.finite(measured + predicted))))
+      
+      ## Lin's CCC calculation
+      PLSR_LCCC <- ccc(data = pls.model.nir.predictions, truth = measured, 
+                       estimate = predicted)
+      
+      Cubist_LCCC <- ccc(data = cubist.model.nir.predictions, truth = measured, 
+                         estimate = predicted)
+      
+      ## RPIQ calculation
+      PLSR_RPIQ <- rpiq(data = pls.model.nir.predictions, truth = measured, 
+                        estimate = predicted)
+      
+      Cubist_RPIQ <- rpiq(data = cubist.model.nir.predictions, truth = measured, 
+                          estimate = predicted)
+      
+      ## End of tic/toc for run timing and future comparisons
+      toc <- Sys.time() - tic
+      print(toc)
+      
+      ## Adding performance metrics to performance_metrics df
+      performance_metrics_NIR_wet <- bind_rows(performance_metrics_NIR_wet,
+                                                  c(new_data$metaData, 
+                                                        list(P.RMSE = PLSR_RMSE, 
+                                                             P.LCCC = PLSR_LCCC$.estimate,
+                                                             P.RPIQ = PLSR_RPIQ$.estimate,
+                                                             P.lm_p = glance(PLSR_reg)$p.value,
+                                                             P.lm_r2 = glance(PLSR_reg)$r.squared, 
+                                                             P.lm_intercept= tidy(PLSR_reg)$estimate[1],
+                                                             P.lm_slope = tidy(PLSR_reg)$estimate[2], 
+                                                             C.RMSE = Cubist_RMSE, 
+                                                             C.LCCC = Cubist_LCCC$.estimate,
+                                                             C.RPIQ = Cubist_RPIQ$.estimate,
+                                                             C.lm_p = glance(Cubist_reg)$p.value,
+                                                             C.lm_r2 = glance(Cubist_reg)$r.squared, 
+                                                             C.lm_intercept= tidy(Cubist_reg)$estimate[1],
+                                                             C.lm_slope = tidy(Cubist_reg)$estimate[2], 
+                                                             runtime = format(toc, units = 'secs'), 
+                                                             rep = for_rep,
+                                                             objectsize = format(object.size(new_data), units = "Mb"))))
+      
+      
+    }
+  }
+  
+  ## Write performance metrics matrix to a csv
+  write_csv(performance_metrics_NIR_wet, file.path(results_dir, 
+                                                   "wetdry_pred_results_20251117.csv"))
+  
+  ## Write all PLSR predictions to a csv
+  write_csv(all.nir.plsr.drywet.pred, file.path(results_dir, 
+                                                   "NIR_PLSR_drytowet_20251117.csv"))
+  
+  ## Write all Cubist predictions to a csv
+  write_csv(all.nir.cubist.drywet.pred, file.path(results_dir, 
+                                                   "NIR_Cubist_drytowet_20251117.csv"))
+  
+}
+
+performance_metrics_NIR_wet <- read_csv(file.path(results_dir, 
+                                                  "wetdry_pred_results_20251117.csv"))
+
+```
+
+Histogram of performance metrics for dry trained wet predicted NIR scans.
+
+```{r NIR_drywet_metrics_hists}
+
+# Arranging NIR trade-off results for metrics histogram
+NIR_drywet_model_metrics.df <- performance_metrics_NIR_wet %>%
+  pivot_longer(cols = -c(variable, signal, runtime, rep, 
+                         objectsize, Haar_compression_fold), names_to = "metric", 
+               values_to = "performance") %>%
+  mutate(model = case_when(startsWith(metric, "P") ~ 'PLSR', 
+                           TRUE ~ 'Cubist')) %>%
+  mutate(metric = gsub('^P.', '', metric),
+         metric = gsub('^C.', '', metric),
+         metric = gsub('lm_intercept', 'intercept', metric),
+         metric = gsub('lm_slope', 'slope', metric),
+         metric = gsub('lm_p', 'P-value', metric),
+         metric = gsub('lm_r2', 'R squared', metric),
+         metric = gsub('LCCC', "Lin's CCC", metric),
+         #metric = gsub('runtime', "Runtime", metric),
+         variable = gsub('Clay_log', 'Clay [log(%Clay)]', variable),
+         variable = gsub('OC_log', 'OC [log(%OC)]', variable),
+         variable = gsub('pH_log', 'pH-H2O', variable))
+
+# NIR and Haar model cal/val metrics histogram figure
+ggplot(data = NIR_drywet_model_metrics.df %>%
+         filter(metric %in% c("R squared", "Lin's CCC", "RMSE", "RPIQ"))) +
+  geom_histogram(aes(x = performance)) +
+  facet_wrap(variable ~ metric , scales = "free") +
+  labs(x = "Performance Metric Value", y = "") +
+  theme(panel.grid.minor = element_blank(),
+        axis.title.y = element_blank(),
+        axis.title = element_text(size = 13, color = "Black"),
+        axis.text = element_text(size = 13, color = "Black"),
+        strip.background =element_rect(fill="white"),
+        strip.text.x = element_text(size = 13, color = "Black"))
+
+# Saving dry predict wet NIR model val metrics histogram figure
+ggsave("DryWet_ModelVal_perf_hist_20251118.png", width = 12, height = 12, 
+       path = fig_dir, dpi = 300, units = "in")
+
+```
+
+## Using subset dry NIR model to predict OC from wet NIR scans
+
+Predicting wet OC using un-transformed subset dry NIR trained model.
+
+```{r subNIR_dry_predict_wet}
+
+if(!file.exists(file.path(results_dir, 'subset_wetdry_pred_results_20251117.csv'))){
+  
+  set.seed(222)
+  
+  performance_metrics_NIR_wet <- data.frame()
+  all.nir.plsr.drywet.pred <- data.frame()
+  all.nir.cubist.drywet.pred <- data.frame()
+  plsr.coef <- list()
+  
+  #for(signal in c('nir', 'Haar')){
+  for(var_name in c('OC_log', 'pH_log', 'Clay_log')){
+    
+    # Add for loop for CV and add an index into performance metrics to track which
+    # ...replicate it is (rep)
+    for (for_rep in 1:30) {
+      
+      
+      signal <- 'nir'
+      #var_name <- 'OC'  
+      signal_compression <- 0
+      
+      if(signal == 'nir' & signal_compression != 0){
+        next
+      }
+      
+      #new_data <- make_ML_data(variable_name = var_name, 
+      #                         signal_data = signal, 
+      #                         Haar_compression_fold = signal_compression)
+      
+      temp_property <- wet_Lab_data %>%
+        dplyr::select(sample_id, all_of(var_name))
+      
+      new_data <- list(data = temp_property %>%
+                         inner_join(wet_nir_spectra, by = "sample_id"),
+                       metaData = list(variable = var_name, 
+                                       signal = signal, 
+                                       Haar_compression_fold = 'NA'))
+      
+      rm(temp_property) # since large data
+      
+      # Preparing for PLSR
+      ## Beginning of tic/toc for run timing and future comparisons
+      tic <- Sys.time()
+      
+      ## Selecting component count as either 20 or number of component columns 
+      ## ...in data
+      # We do not have 20 components here: how many independent variables in 
+      # ...the data frame that we are using for the prediction
+      component_count <- min(20, ncol(new_data$data)-2)
+      
+      ## Setting seed for random selection in calibration/validation split
+      #set.seed(222) -> when do bootstraps, do not set random seed
+      
+      ## Splitting data with 80% (4/5) going to training set
+      data_split <- initial_split(new_data$data, prop = 4/5) # for bootstrapping
+      
+      # Model validation
+      ## Setting tidymodels workflow
+      test_data  <- testing(data_split)
+      recipe_test <- test_data %>%
+        recipe() %>%
+        update_role(everything()) %>%
+        update_role(c("sample_id"), new_role = "id variable") %>%
+        update_role(new_data$metaData$variable, new_role = "outcome") %>%
+        prep()
+      
+      ## PLSR predicting
+      NIR_dry_PLSR_model <- readRDS(file.path(models_dir, paste0(var_name,
+                                                           signal_compression,
+                                                           signal,
+                                                           for_rep,
+                                                          "subset_NIR_dry_train_PLSR.rds",
+                                                                    collapse = "_")))
+      
+      pls.model.nir.predictions <- predict(NIR_dry_PLSR_model, ncomp = component_count, 
+                                           newdata = list(spectra = juice(recipe_test, composition = "matrix", all_predictors()))) %>%
+        as.data.frame() %>%
+        setNames('plsr_prediction') %>%
+        bind_cols(test_data %>% 
+                    select(all_of(new_data$metaData$variable), sample_id))
+      
+      names(pls.model.nir.predictions) <- c('predicted', 'measured', 'sample_id')
+      
+      # Saving all predicted values for all reps and loops to evaluate spread of 
+      # ...data without effects of linear regression
+      all.nir.plsr.drywet.pred <- bind_rows(all.nir.plsr.drywet.pred,
+                                               c(pls.model.nir.predictions,
+                                                 new_data$metaData,
+                                                 list(rep = for_rep)))
+      
+      ## Cubist predicting
+      NIR_dry_Cubist_model <- readRDS(file.path(models_dir, paste0(var_name,
+                                                           signal_compression,
+                                                           signal,
+                                                           for_rep,
+                                                          "subset_NIR_dry_train_Cubist.rds",
+                                                                    collapse = "_")))
+      
+      cubist_pred_data <- cbind(x = juice(recipe_test, 
+                                composition = "matrix", all_outcomes()),
+        y = juice(recipe_test, 
+                    composition = "matrix",
+                    all_predictors()))
+      
+      cubist.model.nir.predictions <- predict(NIR_dry_Cubist_model, 
+                                        newdata = cubist_pred_data, 
+                                        neighbors = 0) %>%
+        as.data.frame() %>%
+        setNames('cubist_prediction') %>%
+        bind_cols(test_data %>% 
+                    select(all_of(new_data$metaData$variable), sample_id))
+      
+      names(cubist.model.nir.predictions) <- c('predicted', 'measured', 'sample_id')
+      
+      # Saving all predicted values for all reps and loops to evaluate spread of 
+      # ...data without effects of linear regression
+      all.nir.cubist.drywet.pred <- bind_rows(all.nir.cubist.drywet.pred,
+                                               c(cubist.model.nir.predictions,
+                                                 new_data$metaData,
+                                                 list(rep = for_rep)))
+      
+      if(!grepl('_log', var_name)){
+        pls.model.nir.predictions <- pls.model.nir.predictions %>%
+          mutate(predicted = log(predicted),
+                 measured = log(measured))
+      }
+      
+      # Evaluation of model performance
+      ## Plot of predicted vs estimated values
+      
+      if(for_rep == 1){
+        
+        ggplot(pls.model.nir.predictions,
+               aes(x = measured, 
+                   y = predicted)) +
+          geom_hex()  +
+          geom_abline(color = 'red') +
+          labs(x = 'Estimated', 
+               y = 'Predicted',
+               title = paste(new_data$metaData$variable, new_data$metaData$signal, 
+                             'at energy', new_data$metaData$energy)) +
+          theme_bw() +
+          theme(panel.background = element_blank(),
+                panel.grid.major = element_blank(),
+                axis.title = element_text(size = 13, color = "Black"),
+                axis.text = element_text(size = 13, color = "Black"),
+                panel.grid.minor = element_blank())
+        
+        ggsave(sprintf("%s_%s_%s_pred_calc_figure_NIR_drywet.png", 
+                       new_data$metaData$variable, 
+                       new_data$metaData$signal, 
+                       new_data$metaData$Haar_compression_fold), 
+               width = 6, height = 6, 
+               path = fig_dir, dpi = 300, units = "in")
+        
+      }
+      
+      
+      ## Linear regression
+      PLSR_reg <- lm(formula = predicted ~ measured,
+                     data = pls.model.nir.predictions)
+      
+      Cubist_reg <- lm(formula = predicted ~ measured,
+                       data = cubist.model.nir.predictions)
+      
+      ## RMSE calculation
+      PLSR_RMSE <- with(pls.model.nir.predictions, 
+                        sqrt(sum((predicted - measured)^2, na.rm=TRUE) / 
+                               sum(is.finite(measured + predicted))))
+      
+      Cubist_RMSE <- with(cubist.model.nir.predictions, 
+                          sqrt(sum((predicted - measured)^2, na.rm=TRUE) / 
+                                 sum(is.finite(measured + predicted))))
+      
+      ## Lin's CCC calculation
+      PLSR_LCCC <- ccc(data = pls.model.nir.predictions, truth = measured, 
+                       estimate = predicted)
+      
+      Cubist_LCCC <- ccc(data = cubist.model.nir.predictions, truth = measured, 
+                         estimate = predicted)
+      
+      ## RPIQ calculation
+      PLSR_RPIQ <- rpiq(data = pls.model.nir.predictions, truth = measured, 
+                        estimate = predicted)
+      
+      Cubist_RPIQ <- rpiq(data = cubist.model.nir.predictions, truth = measured, 
+                          estimate = predicted)
+      
+      ## End of tic/toc for run timing and future comparisons
+      toc <- Sys.time() - tic
+      print(toc)
+      
+      ## Adding performance metrics to performance_metrics df
+      performance_metrics_NIR_wet <- bind_rows(performance_metrics_NIR_wet,
+                                                  c(new_data$metaData, 
+                                                        list(P.RMSE = PLSR_RMSE, 
+                                                             P.LCCC = PLSR_LCCC$.estimate,
+                                                             P.RPIQ = PLSR_RPIQ$.estimate,
+                                                             P.lm_p = glance(PLSR_reg)$p.value,
+                                                             P.lm_r2 = glance(PLSR_reg)$r.squared, 
+                                                             P.lm_intercept= tidy(PLSR_reg)$estimate[1],
+                                                             P.lm_slope = tidy(PLSR_reg)$estimate[2], 
+                                                             C.RMSE = Cubist_RMSE, 
+                                                             C.LCCC = Cubist_LCCC$.estimate,
+                                                             C.RPIQ = Cubist_RPIQ$.estimate,
+                                                             C.lm_p = glance(Cubist_reg)$p.value,
+                                                             C.lm_r2 = glance(Cubist_reg)$r.squared, 
+                                                             C.lm_intercept= tidy(Cubist_reg)$estimate[1],
+                                                             C.lm_slope = tidy(Cubist_reg)$estimate[2], 
+                                                             runtime = format(toc, units = 'secs'), 
+                                                             rep = for_rep,
+                                                             objectsize = format(object.size(new_data), units = "Mb"))))
+      
+      
+    }
+  }
+  
+  ## Write performance metrics matrix to a csv
+  write_csv(performance_metrics_NIR_wet, file.path(results_dir, 
+                                                   "subset_wetdry_pred_results_20251117.csv"))
+  
+  ## Write all PLSR predictions to a csv
+  write_csv(all.nir.plsr.drywet.pred, file.path(results_dir, 
+                                                   "subset_NIR_PLSR_drytowet_20251117.csv"))
+  
+  ## Write all Cubist predictions to a csv
+  write_csv(all.nir.cubist.drywet.pred, file.path(results_dir, 
+                                                   "subset_NIR_Cubist_drytowet_20251117.csv"))
+  
+}
+
+performance_metrics_NIR_wet <- read_csv(file.path(results_dir, 
+                                                  "subset_wetdry_pred_results_20251117.csv"))
+
+```
+
+Histogram of performance metrics for subset dry trained wet predicted NIR scans.
+
+```{r subNIR_drywet_metrics_hists}
+
+# Arranging NIR trade-off results for metrics histogram
+subNIR_drywet_model_metrics.df <- performance_metrics_NIR_wet %>%
+  pivot_longer(cols = -c(variable, signal, runtime, rep, 
+                         objectsize, Haar_compression_fold), names_to = "metric", 
+               values_to = "performance") %>%
+  mutate(model = case_when(startsWith(metric, "P") ~ 'PLSR', 
+                           TRUE ~ 'Cubist')) %>%
+  mutate(metric = gsub('^P.', '', metric),
+         metric = gsub('^C.', '', metric),
+         metric = gsub('lm_intercept', 'intercept', metric),
+         metric = gsub('lm_slope', 'slope', metric),
+         metric = gsub('lm_p', 'P-value', metric),
+         metric = gsub('lm_r2', 'R squared', metric),
+         metric = gsub('LCCC', "Lin's CCC", metric),
+         #metric = gsub('runtime', "Runtime", metric),
+         variable = gsub('Clay_log', 'Clay [log(%Clay)]', variable),
+         variable = gsub('OC_log', 'OC [log(%OC)]', variable),
+         variable = gsub('pH_log', 'pH-H2O', variable))
+
+# NIR and Haar model cal/val metrics histogram figure
+ggplot(data = subNIR_drywet_model_metrics.df %>%
+         filter(metric %in% c("R squared", "Lin's CCC", "RMSE", "RPIQ"))) +
+  geom_histogram(aes(x = performance)) +
+  facet_wrap(variable ~ metric , scales = "free") +
+  labs(x = "Performance Metric Value", y = "") +
+  theme(panel.grid.minor = element_blank(),
+        axis.title.y = element_blank(),
+        axis.title = element_text(size = 13, color = "Black"),
+        axis.text = element_text(size = 13, color = "Black"),
+        strip.background =element_rect(fill="white"),
+        strip.text.x = element_text(size = 13, color = "Black"))
+
+# Saving dry predict wet NIR model val metrics histogram figure
+ggsave("sub_DryWet_ModelVal_perf_hist_20251118.png", width = 12, height = 12, 
+       path = fig_dir, dpi = 300, units = "in")
+
+```
+
+# Wet Haar data
+
+Haar transformation of wet NIR scans
+
+```{r Haar_transform_wet}
+
+if(!file.exists(file.path(wet_dir, 
+                          'Haar_NIR_wet_scans_20251117.csv'))){
+  
+  tic <- Sys.time()
+  
+  # Change name of input file to transform NIR data
+  input_file <- wet_nir_spectra
+  
+  #info <- subset(input_file, select = c(WOODWELL_ID, ScanPeriod, SAMPLE_ID, Grav, EOC, SCAN_ID))
+  #info <- subset(input_file, select = c(sample_id))
+  
+  nir.df <- input_file %>%
+    #select(-c(sample_id)) %>%
+    #rename(sample_id = SCAN_ID) %>%
+    pivot_longer(cols = -sample_id, 
+                 #cols = everything(), 
+                 names_to = 'Wavelength', values_to = 'Values') %>%
+    mutate(Wavelength = as.numeric(Wavelength)) %>%
+    mutate(Wavelength = round(Wavelength, digits = 0)) %>%
+    pivot_wider(names_from = Wavelength, values_from = Values)
+  
+  #Remove sample_id and make those row_names
+  
+  sample_names <- nir.df$sample_id
+  nir.df$sample_id <- NULL
+  nir.df <- as.matrix(nir.df)
+  row.names(nir.df) <- sample_names
+  
+  #wavelet_size <- min(2^11, ncol(mir.df))
+  wavelet_size <- 2^9
+  
+  # 2^9 = 512
+  # 512 - 420 = 92 -> need to pad with 92
+  
+  pad_index <- (ncol(nir.df)-1):(ncol(nir.df)-(wavelet_size-ncol(nir.df)))
+  #pad_index <- c()
+  #mir.df[,pad_index] <- mir.df[,pad_index]/2
+  
+  first_index <- c(1:ncol(nir.df), pad_index)
+  
+  odd_indicies <- rep(c(TRUE, FALSE), times = wavelet_size/2)
+  even_indicies <- rep(c(FALSE, TRUE), times = wavelet_size/2)
+  
+  wavelet <- array(NA_real_, dim = c(nrow(nir.df), wavelet_size))
+  
+  #calculate the trend
+  wavelet[ ,1:(wavelet_size/2)] <- (nir.df[,first_index[odd_indicies] ] + 
+                                      nir.df[,first_index[even_indicies]]) / sqrt(2)
+  ##check trend
+  #wavelet[1:10, 1:10]
+  
+  #calculate the flux
+  wavelet[,wavelet_size/2 + (1:(wavelet_size/2))] <- (nir.df[,first_index[odd_indicies]] -
+                                                        nir.df[,first_index[even_indicies]]) / sqrt(2)
+  ##check flux
+  #wavelet[1:10, wavelet_size/2+ (1:10)]
+  
+  #record the names
+  wavelet_names <- rep(NA_character_, length.out = wavelet_size)
+  wavelet_names[wavelet_size/2 + (1:(wavelet_size/2))] <- paste0('H11_I', 1:(wavelet_size/2))
+  
+  for(wavelet_size in 2^( (log(wavelet_size, base=2)-1):1)){
+    #wavelet_size <- 2^10
+    odd_indicies <- c(rep(c(TRUE, FALSE), times = wavelet_size/2), 
+                      rep(FALSE, length.out = ncol(wavelet) - wavelet_size))
+    even_indicies <- c(rep(c(FALSE, TRUE), times = wavelet_size/2), 
+                       rep(FALSE, length.out = ncol(wavelet) - wavelet_size))
+    
+    #calculate the trend
+    trend <- (wavelet[,odd_indicies] + wavelet[,even_indicies]) / sqrt(2)
+    #calculate the flux
+    flux <- (wavelet[,odd_indicies] - wavelet[,even_indicies]) / sqrt(2)
+    
+    wavelet[ ,1:(wavelet_size/2)] <- trend
+    wavelet[,wavelet_size/2 + (1:(wavelet_size/2))] <- flux
+    
+    #save the names
+    wavelet_names[wavelet_size/2 + (1:(wavelet_size/2))] <- paste0('H',log(wavelet_size, base = 2),
+                                                                   '_I', 1:(wavelet_size/2))
+  }
+  wavelet_names[1] <- 'H0_I1'
+  
+  toc <- Sys.time()
+  toc - tic
+  #100 wavelets in 0.99 secs
+  #1000 wavelets in 1.75 sec
+  #1e4 7.9 sec
+  #everything 54 seconds
+  
+  wet_transformed <- wavelet %>%
+    as.data.frame()
+  names(wet_transformed) <- wavelet_names
+  wet_transformed$sample_id <- sample_names
+  #wet_transformed <- cbind(wet_transformed, info)
+  
+  # Save Haar wavelet transformed data
+  write_csv(wet_transformed, file.path(wet_dir, "Haar_NIR_wet_scans_20251117.csv"))
+  
+}
+
+transformed_wet <- read_csv(file.path(wet_dir, 
+                                      'Haar_NIR_wet_scans_20251117.csv')) %>%
+  select(sample_id, everything()) %>%
+  separate(sample_id, sep = "_", c("kssl_id", NA), remove = F) 
+
+```
+
+##  Train and validate wet Haar model
+
+Train wet Haar model with wet lab and transformed wet NIR scans.
+
+```{r Wet_Haar_cal_val}
+  
+if(!file.exists(file.path(results_dir, 
+                          'NIR_wet_Haarmodel_cal_results_20251117.csv'))){
+  
+  # For loops for data, property, and energy selections for PLSR below
+  NIR_wet_Haar_calval <- data.frame()
+  all.PLSR.Haar.wet.predictions <- data.frame()
+  all.Cubist.Haar.wet.predictions <- data.frame()
+  plsr.coef <- list()
+  
+  for(var_name in c('OC_log', 'pH_log', 'Clay_log')){
+    
+    for(signal_compression in 0:8){
+      
+      for(for_rep in 1:30){
+        
+        signal <- 'Haar'
+        #var_name <- 'OC'  
+        #signal_compression <- 0
+        
+        #new_data <- make_ML_data(variable_name = var_name, 
+        #                         signal_data = signal, 
+        #                         Haar_compression_fold = signal_compression)
+        
+        temp_property <- wet_Lab_data %>%
+          dplyr::select(sample_id, all_of(var_name))
+        
+        if(!is.finite(signal_compression) | signal_compression < 0 | signal_compression > 12){
+          stop('bad compression size') # if its not bad, it still goes through - because we have stop here we don't need else structure
+        }
+        
+        signal_size <- (ncol(transformed_wet)-2) * (1/2)^signal_compression
+        Haar_index <- 2 + #add the sample_id
+          2:signal_size #skip the final trend (HaarInf_1) -> imposing a high-pass
+        # last trend kind of like overall average in signal
+        
+        data <- transformed_wet[,c(1:2, Haar_index)] # since 2 ID columns
+        
+        ## Adding property, source data, and energy selection to output table
+        new_data <- list(data = temp_property %>%
+                           inner_join(data, by = "sample_id"),
+                         metaData = list(variable = var_name, 
+                                         signal = signal, 
+                                         Haar_compression_fold = as.character(signal_compression)))
+        
+        #new_data$data <- as.matrix(new_data$data) # hoping this will fix error
+        
+        rm(temp_property) # since large data
+        
+        # Preparing for PLSR
+        ## Beginning of tic/toc for run timing and future comparisons
+        tic <- Sys.time()
+        
+        ## Selecting component count as either 20 or number of component columns 
+        ## ...in data
+        # We do not have 20 components here: how many independent variables in 
+        # ...the data frame that we are using for the prediction
+        component_count <- min(20, ncol(new_data$data)-3)
+        
+        ## Splitting data with 80% (4/5) going to training set
+        data_split <- group_initial_split(new_data$data, prop = 4/5,
+                                        group = kssl_id)
+        
+        # Model Calibration
+        ## Assigning calibration data
+        train_data <- training(data_split)
+        
+        ## Setting tidymodels workflow
+        recipe_train <- train_data %>%
+          select(-kssl_id) %>%
+          recipe() %>%
+          update_role(everything()) %>%
+          update_role(c("sample_id"), new_role = "id variable") %>%
+          update_role(new_data$metaData$variable, new_role = "outcome") %>%
+          prep()
+        
+        ## PLSR calibration
+        pls.model.nir.wet.Haar <- plsr(target ~ spectra, 
+                                       data = list(target = juice(recipe_train, 
+                                                                  composition = "matrix",
+                                                                  all_outcomes()), 
+                                                   spectra = juice(recipe_train, 
+                                                                   composition = "matrix",
+                                                                   all_predictors())),
+                                       ncomp = component_count, scale = FALSE, center = FALSE)
+        #gc()
+        
+        if(for_rep == 1){
+          
+          saveRDS(pls.model.nir.wet.Haar, file.path(models_dir, paste0(var_name, 
+                                                                       for_rep,
+                                                                       "PLSR_Haar_wet", 
+                                                                       signal_compression, 
+                                                                       "train_model.rds", collapse = "_")))
+          
+        }
+        
+        plsr.coef[[sprintf('%s_%s_%s', signal, var_name, signal_compression)]] <- 
+          pls.model.nir.wet.Haar$coefficients
+        
+        ## Cubist calibration
+        Cubist.model.nir.wet.Haar <- cubist(y = juice(recipe_train, 
+                                                      composition = "matrix", 
+                                                      all_outcomes()), 
+                                            x = juice(recipe_train, 
+                                                      composition = "matrix",
+                                                      all_predictors()), 
+                                            committees = 5, neighbors = 0)
+        
+        # Saving Cubist model
+        if(for_rep == 1){
+          
+          saveRDS(Cubist.model.nir.wet.Haar, file.path(models_dir, paste0(var_name, 
+                                                                          for_rep,
+                                                                          "Cubist_Haar_wet", 
+                                                                          signal_compression, 
+                                                                          "train_model.rds", collapse = "_")))
+          
+        }
+        
+        # Model validation
+        ## Setting tidymodels workflow
+        test_data <- testing(data_split)
+        
+        recipe_test <- test_data %>%
+          select(-kssl_id) %>%
+          recipe() %>%
+          update_role(everything()) %>%
+          update_role(c("sample_id"), new_role = "id variable") %>%
+          update_role(new_data$metaData$variable, new_role = "outcome") %>%
+          prep()
+        
+        ## PLSR validation
+        pls.model.nir.predictions <- predict(pls.model.nir.wet.Haar, ncomp = component_count, 
+                                             newdata = list(#target = juice(recipe_test, composition = "matrix", all_outcomes()), 
+                                               spectra = juice(recipe_test, composition = "matrix", all_predictors()))) %>%
+          as.data.frame() %>%
+          setNames('plsr_prediction') %>%
+          bind_cols(test_data %>% 
+                      select(all_of(new_data$metaData$variable), sample_id))
+        
+        names(pls.model.nir.predictions) <- c('predicted', 'measured', 'sample_id')
+        
+        # Saving all predicted values for all reps and loops to evaluate spread of 
+        # ...data without effects of linear regression
+        all.PLSR.Haar.wet.predictions <- bind_rows(all.PLSR.Haar.wet.predictions,
+                                                   c(pls.model.nir.predictions,
+                                                     new_data$metaData,
+                                                     list(rep = for_rep)))
+        
+        ## Cubist validation
+        cubist_pred_data <- juice(recipe_test, 
+                                  composition = "matrix", all_outcomes()) %>% 
+          cbind(juice(recipe_test, 
+                      composition = "matrix",
+                      all_predictors()))
+        
+        cubist.model.nir.predictions <- predict(Cubist.model.nir.wet.Haar, 
+                                                newdata = cubist_pred_data, 
+                                                neighbors = 0) %>%
+          as.data.frame() %>%
+          setNames('cubist_prediction') %>%
+          bind_cols(test_data %>% 
+                      select(all_of(new_data$metaData$variable), sample_id))
+        
+        names(cubist.model.nir.predictions) <- c('predicted', 'measured', 'sample_id')
+        
+        # Saving all predicted values for all reps and loops to evaluate spread of 
+        # ...data without effects of linear regression
+        all.Cubist.Haar.wet.predictions <- bind_rows(all.Cubist.Haar.wet.predictions,
+                                                     c(cubist.model.nir.predictions,
+                                                       new_data$metaData,
+                                                       list(rep = for_rep)))
+        
+        if(!grepl('_log', var_name)){
+          pls.model.nir.predictions <- pls.model.nir.predictions %>%
+            mutate(predicted = log(predicted),
+                   measured = log(measured))
+        }
+        
+        # Evaluation of model performance
+        ## Plot of predicted vs estimated values
+        
+        if(for_rep == 1){
+          
+          ggplot(pls.model.nir.predictions,
+                 aes(x = measured, 
+                     y = predicted)) +
+            geom_hex()  +
+            geom_abline(color = 'red') +
+            labs(x = 'Estimated', 
+                 y = 'Predicted',
+                 title = paste(new_data$metaData$variable, new_data$metaData$signal, 
+                               'at energy', new_data$metaData$energy)) +
+            theme_bw() +
+            theme(panel.background = element_blank(),
+                  panel.grid.major = element_blank(),
+                  axis.title = element_text(size = 13, color = "Black"),
+                  axis.text = element_text(size = 13, color = "Black"),
+                  panel.grid.minor = element_blank())
+          
+          ggsave(sprintf("%s_%s_%s_pred_calc_figure_Haar_wet.png", 
+                         new_data$metaData$variable, 
+                         new_data$metaData$signal, 
+                         new_data$metaData$Haar_compression_fold), 
+                 width = 6, height = 6, 
+                 path = fig_dir, dpi = 300, units = "in")
+          
+        }
+        
+        ## Linear regression
+        PLSR_reg <- lm(formula = predicted ~ measured,
+                       data = pls.model.nir.predictions)
+        
+        Cubist_reg <- lm(formula = predicted ~ measured,
+                         data = cubist.model.nir.predictions)
+        
+        ## RMSE calculation
+        PLSR_RMSE <- with(pls.model.nir.predictions, 
+                          sqrt(sum((predicted - measured)^2, na.rm=TRUE) / 
+                                 sum(is.finite(measured + predicted))))
+        
+        Cubist_RMSE <- with(cubist.model.nir.predictions, 
+                            sqrt(sum((predicted - measured)^2, na.rm=TRUE) / 
+                                   sum(is.finite(measured + predicted))))
+        
+        ## Lin's CCC calculation
+        PLSR_LCCC <- ccc(data = pls.model.nir.predictions, truth = measured, 
+                         estimate = predicted)
+        
+        Cubist_LCCC <- ccc(data = cubist.model.nir.predictions, truth = measured, 
+                           estimate = predicted)
+        
+        ## RPIQ calculation
+        PLSR_RPIQ <- rpiq(data = pls.model.nir.predictions, truth = measured, 
+                          estimate = predicted)
+        
+        Cubist_RPIQ <- rpiq(data = cubist.model.nir.predictions, truth = measured, 
+                            estimate = predicted)
+        
+        ## End of tic/toc for run timing and future comparisons
+        toc <- Sys.time() - tic
+        print(toc)
+        
+        ## Adding performance metrics to performance_metrics df
+        NIR_wet_Haar_calval <- bind_rows(NIR_wet_Haar_calval,
+                                         c(new_data$metaData, 
+                                           list(P.RMSE = PLSR_RMSE, 
+                                                P.LCCC = PLSR_LCCC$.estimate,
+                                                P.RPIQ = PLSR_RPIQ$.estimate,
+                                                P.lm_p = glance(PLSR_reg)$p.value,
+                                                P.lm_r2 = glance(PLSR_reg)$r.squared, 
+                                                P.lm_intercept= tidy(PLSR_reg)$estimate[1],
+                                                P.lm_slope = tidy(PLSR_reg)$estimate[2], 
+                                                C.RMSE = Cubist_RMSE, 
+                                                C.LCCC = Cubist_LCCC$.estimate,
+                                                C.RPIQ = Cubist_RPIQ$.estimate,
+                                                C.lm_p = glance(Cubist_reg)$p.value,
+                                                C.lm_r2 = glance(Cubist_reg)$r.squared, 
+                                                C.lm_intercept= tidy(Cubist_reg)$estimate[1],
+                                                C.lm_slope = tidy(Cubist_reg)$estimate[2], 
+                                                runtime = format(toc, units = 'secs'), 
+                                                rep = for_rep,
+                                                objectsize = format(object.size(new_data), units = "Mb"))))
+        
+        
+      }
+    }
+  }
+  
+  ## Write performance metrics matrix to a csv
+  write_csv(NIR_wet_Haar_calval, file.path(results_dir, "NIR_wet_Haarmodel_cal_results_20251117.csv"))
+  
+  ## Write PLSR predictions to a csv
+  write_csv(all.PLSR.Haar.wet.predictions, file.path(results_dir, 
+                                                "Haar_wet_PLSR_20251117.csv"))
+  
+  ## Write Cubist predictions to a csv
+  write_csv(all.Cubist.Haar.wet.predictions, file.path(results_dir, 
+                                                "Haar_wet_Cubist_20251117.csv"))
+
+}
+
+NIR_wet_Haar_calval <- read_csv(file.path(results_dir, "NIR_wet_Haarmodel_cal_results_20251117.csv"))
+
+```
+
+Histogram of performance metrics for wet Haar calibrated and validated NIR 
+scans.
+
+```{r Haar_wet_metrics_hists}
+
+# Arranging NIR trade-off results for metrics histogram
+Haar_wet_model_metrics.df <- NIR_wet_Haar_calval %>%
+  pivot_longer(cols = -c(variable, signal, runtime, rep, 
+                         objectsize, Haar_compression_fold), names_to = "metric", 
+               values_to = "performance") %>%
+  mutate(model = case_when(startsWith(metric, "P") ~ 'PLSR', 
+                           TRUE ~ 'Cubist')) %>%
+  mutate(metric = gsub('^P.', '', metric),
+         metric = gsub('^C.', '', metric),
+         metric = gsub('lm_intercept', 'intercept', metric),
+         metric = gsub('lm_slope', 'slope', metric),
+         metric = gsub('lm_p', 'P-value', metric),
+         metric = gsub('lm_r2', 'R squared', metric),
+         metric = gsub('LCCC', "Lin's CCC", metric),
+         #metric = gsub('runtime', "Runtime", metric),
+         variable = gsub('Clay_log', 'Clay [log(%Clay)]', variable),
+         variable = gsub('OC_log', 'OC [log(%OC)]', variable),
+         variable = gsub('pH_log', 'pH-H2O', variable))
+
+# NIR and Haar model cal/val metrics histogram figure
+ggplot(data = Haar_wet_model_metrics.df %>%
+         filter(metric %in% c("R squared", "Lin's CCC", "RMSE", "RPIQ"))) +
+  geom_histogram(aes(x = performance)) +
+  facet_wrap(variable ~ metric , scales = "free") +
+  labs(x = "Performance Metric Value", y = "") +
+  theme(panel.grid.minor = element_blank(),
+        axis.title.y = element_blank(),
+        axis.title = element_text(size = 13, color = "Black"),
+        axis.text = element_text(size = 13, color = "Black"),
+        strip.background =element_rect(fill="white"),
+        strip.text.x = element_text(size = 13, color = "Black"))
+
+# Saving Haar dry NIR model val metrics histogram figure
+ggsave("Haar_wet_ModelVal_perf_hist_20251118.png", width = 12, height = 12, 
+       path = fig_dir, dpi = 300, units = "in")
+
+```
+
+Histogram of performance metrics for wet near-infrared and wet Haar calibrated 
+model validation performance.
+
+```{r both_wet_metrics_hists}
+
+# Arranging NIR trade-off results for metrics histogram
+both_wet_model_metrics.df <- NIR_wet_Haar_calval %>%
+  rbind(read_csv(file.path(results_dir, 
+                           "NIR_wet_train_results_20251117.csv"))) %>%
+  pivot_longer(cols = -c(variable, signal, runtime, rep, 
+                         objectsize, Haar_compression_fold), names_to = "metric", 
+               values_to = "performance") %>%
+  mutate(model = case_when(startsWith(metric, "P") ~ 'PLSR', 
+                           TRUE ~ 'Cubist')) %>%
+  mutate(metric = gsub('^P.', '', metric),
+         metric = gsub('^C.', '', metric),
+         metric = gsub('lm_intercept', 'Intercept', metric),
+         metric = gsub('lm_slope', 'Slope', metric),
+         metric = gsub('lm_p', 'P-value', metric),
+         metric = gsub('lm_r2', 'R squared', metric),
+         metric = gsub('LCCC', "Lin's CCC", metric),
+         #metric = gsub('runtime', "Runtime", metric),
+         variable = gsub('Clay_log', 'Clay [log(%Clay)]', variable),
+         variable = gsub('OC_log', 'OC [log(%OC)]', variable),
+         variable = gsub('pH_log', 'pH-H2O', variable))
+
+# NIR and Haar model cal/val metrics histogram figure
+ggplot(data = both_wet_model_metrics.df %>%
+         filter(metric %in% c("R squared", "Lin's CCC", "RMSE", "RPIQ", 
+                              "Slope", "Intercept"))) +
+  geom_histogram(aes(x = performance)) +
+  facet_wrap(variable ~ metric , scales = "free", ncol = 6) +
+  labs(x = "Performance Metric Value", y = "") +
+  theme(panel.grid.minor = element_blank(),
+        axis.title.y = element_blank(),
+        axis.title = element_text(size = 13, color = "Black"),
+        axis.text = element_text(size = 13, color = "Black"),
+        strip.background =element_rect(fill="white"),
+        strip.text.x = element_text(size = 13, color = "Black"))
+
+# Saving Haar dry NIR model val metrics histogram figure
+ggsave("both_wet_ModelVal_perf_hist_20251203.png", width = 15, height = 12, 
+       path = fig_dir, dpi = 300, units = "in")
+
+```
+
+# Using dry Haar model to predict OC from wet Haar scans
+
+Predicting Haar transformed wet OC with Haar transformed dry trained model.
+
+```{r Haar_dry_predict_wet}
+
+if(!file.exists(file.path(results_dir, 'NIR_Haar_drypredwet_results_20251117.csv'))){
+  
+  ## Setting seed for random selection in calibration/validation split
+  set.seed(222)
+  
+  performance_metrics_Haar_wet <- data.frame()
+  all.Haar.PLSR.drywet.pred <- data.frame()
+  all.Haar.Cubist.drywet.pred <- data.frame()
+  plsr.coef <- list()
+  
+  #for(signal in c('nir', 'Haar')){
+  for(var_name in c('OC_log', 'pH_log', 'Clay_log')){
+    
+    for(signal_compression in 0:8){
+      
+      for(for_rep in 1:30) {
+        
+        signal <- 'Haar'
+        #var_name <- 'OC'  
+        #signal_compression <- 0
+        
+        #new_data <- make_ML_data(variable_name = var_name, 
+        #                         signal_data = signal, 
+        #                         Haar_compression_fold = signal_compression)
+        
+        temp_property <- wet_Lab_data %>%
+          dplyr::select(sample_id, all_of(var_name))
+        
+        if(!is.finite(signal_compression) | signal_compression < 0 | signal_compression > 12){
+          stop('bad compression size')
+        }
+        
+        signal_size <- (ncol(transformed_wet)-2) * (1/2)^signal_compression
+        Haar_index <- 2 + #add the sample_id
+          2:signal_size #skip the final trend (HaarInf_1) -> imposing a high-pass
+        
+        transformed_wet_pass <- transformed_wet[,c(1:2, Haar_index)] %>%
+          select(-kssl_id)
+        
+        new_data <- list(data = temp_property %>%
+                           inner_join(transformed_wet_pass, by = "sample_id"),
+                         metaData = list(variable = var_name, 
+                                         signal = signal, 
+                                         Haar_compression_fold = as.character(signal_compression)))
+        
+        rm(temp_property) # since large data
+        
+        # Preparing for PLSR
+        ## Beginning of tic/toc for run timing and future comparisons
+        tic <- Sys.time()
+        
+        ## Selecting component count as either 20 or number of component columns 
+        ## ...in data
+        # We do not have 20 components here: how many independent variables in 
+        # ...the data frame that we are using for the prediction
+        component_count <- min(20, ncol(new_data$data)-2)
+        
+        ## Splitting data with 80% (4/5) going to training set
+        data_split <- initial_split(new_data$data, prop = 4/5)
+        
+        # Model validation
+        ## Setting tidymodels workflow
+        test_data  <- testing(data_split)
+        
+        recipe_test <- test_data %>%
+          recipe() %>%
+          update_role(everything()) %>%
+          update_role(c("sample_id"), new_role = "id variable") %>%
+          update_role(new_data$metaData$variable, new_role = "outcome") %>%
+          prep()
+        
+        ## PLSR predictions
+        Haar_PLSR_dry_train_model <- readRDS(file.path(models_dir, 
+                                                  paste0(var_name,
+                                                        signal_compression,
+                                                        signal,
+                                                        for_rep,
+                                                        "full_NIR_dry_train_PLSR.rds",
+                                                          collapse = "_")))
+                                                         
+        pls.model.nir.predictions <- predict(Haar_PLSR_dry_train_model, ncomp = component_count, 
+                                             newdata = list(spectra = juice(recipe_test, composition = "matrix", all_predictors()))) %>%
+          as.data.frame() %>%
+          setNames('plsr_prediction') %>%
+          bind_cols(test_data %>% 
+                      select(all_of(new_data$metaData$variable), sample_id))
+        
+        names(pls.model.nir.predictions) <- c('predicted', 'measured', 'sample_id')
+        
+        # Saving all predicted values for all reps and loops to evaluate spread of 
+        # ...data without effects of linear regression
+        all.Haar.PLSR.drywet.pred <- bind_rows(all.Haar.PLSR.drywet.pred,
+                                                  c(pls.model.nir.predictions,
+                                                    new_data$metaData,
+                                                    list(rep = for_rep)))
+        
+        ## Cubist predictions
+        Haar_Cubist_dry_train_model <- readRDS(file.path(models_dir, 
+                                                  paste0(var_name,
+                                                        signal_compression,
+                                                        signal,
+                                                        for_rep,
+                                                        "full_NIR_dry_train_Cubist.rds",
+                                                          collapse = "_")))
+        
+        cubist_pred_data <- juice(recipe_test, 
+                                composition = "matrix", all_outcomes()) %>% 
+        cbind(juice(recipe_test, 
+                    composition = "matrix",
+                    all_predictors()))
+      
+      cubist.model.nir.predictions <- predict(Haar_Cubist_dry_train_model, 
+                                        newdata = cubist_pred_data, 
+                                        neighbors = 0) %>%
+        as.data.frame() %>%
+        setNames('cubist_prediction') %>%
+        bind_cols(test_data %>% 
+                    select(all_of(new_data$metaData$variable), sample_id))
+        
+        names(cubist.model.nir.predictions) <- c('predicted', 'measured', 'sample_id')
+        
+        # Saving all predicted values for all reps and loops to evaluate spread of 
+        # ...data without effects of linear regression
+        all.Haar.Cubist.drywet.pred <- bind_rows(all.Haar.Cubist.drywet.pred,
+                                                  c(cubist.model.nir.predictions,
+                                                    new_data$metaData,
+                                                    list(rep = for_rep)))
+        
+        if(!grepl('_log', var_name)){
+          pls.model.nir.predictions <- pls.model.nir.predictions %>%
+            mutate(predicted = log(predicted),
+                   measured = log(measured))
+        }
+        
+        # Evaluation of model performance
+        ## Plot of predicted vs estimated values
+        
+        if(for_rep == 1){
+          
+          ggplot(pls.model.nir.predictions,
+                 aes(x = measured, 
+                     y = predicted)) +
+            geom_hex()  +
+            geom_abline(color = 'red') +
+            labs(x = 'Estimated', 
+                 y = 'Predicted',
+                 title = paste(new_data$metaData$variable, new_data$metaData$signal, 
+                               'at energy', new_data$metaData$energy)) +
+            theme_bw() +
+            theme(panel.background = element_blank(),
+                  panel.grid.major = element_blank(),
+                  axis.title = element_text(size = 13, color = "Black"),
+                  axis.text = element_text(size = 13, color = "Black"),
+                  panel.grid.minor = element_blank())
+          
+          ggsave(sprintf("%s_%s_%s_pred_calc_figure_Haar_drywet.png", 
+                         new_data$metaData$variable, 
+                         new_data$metaData$signal, 
+                         new_data$metaData$Haar_compression_fold), 
+                 width = 6, height = 6, 
+                 path = fig_dir, dpi = 300, units = "in")
+          
+        }
+        
+        ## Linear regression
+      PLSR_reg <- lm(formula = predicted ~ measured,
+                     data = pls.model.nir.predictions)
+      
+      Cubist_reg <- lm(formula = predicted ~ measured,
+                       data = cubist.model.nir.predictions)
+      
+      ## RMSE calculation
+      PLSR_RMSE <- with(pls.model.nir.predictions, 
+                        sqrt(sum((predicted - measured)^2, na.rm=TRUE) / 
+                               sum(is.finite(measured + predicted))))
+      
+      Cubist_RMSE <- with(cubist.model.nir.predictions, 
+                          sqrt(sum((predicted - measured)^2, na.rm=TRUE) / 
+                                 sum(is.finite(measured + predicted))))
+      
+      ## Lin's CCC calculation
+      PLSR_LCCC <- ccc(data = pls.model.nir.predictions, truth = measured, 
+                       estimate = predicted)
+      
+      Cubist_LCCC <- ccc(data = cubist.model.nir.predictions, truth = measured, 
+                         estimate = predicted)
+      
+      ## RPIQ calculation
+      PLSR_RPIQ <- rpiq(data = pls.model.nir.predictions, truth = measured, 
+                        estimate = predicted)
+      
+      Cubist_RPIQ <- rpiq(data = cubist.model.nir.predictions, truth = measured, 
+                          estimate = predicted)
+      
+      ## End of tic/toc for run timing and future comparisons
+      toc <- Sys.time() - tic
+      print(toc)
+      
+      ## Adding performance metrics to performance_metrics df
+      performance_metrics_Haar_wet <- bind_rows(performance_metrics_Haar_wet,
+                                                  c(new_data$metaData, 
+                                                        list(P.RMSE = PLSR_RMSE, 
+                                                             P.LCCC = PLSR_LCCC$.estimate,
+                                                             P.RPIQ = PLSR_RPIQ$.estimate,
+                                                             P.lm_p = glance(PLSR_reg)$p.value,
+                                                             P.lm_r2 = glance(PLSR_reg)$r.squared, 
+                                                             P.lm_intercept= tidy(PLSR_reg)$estimate[1],
+                                                             P.lm_slope = tidy(PLSR_reg)$estimate[2], 
+                                                             C.RMSE = Cubist_RMSE, 
+                                                             C.LCCC = Cubist_LCCC$.estimate,
+                                                             C.RPIQ = Cubist_RPIQ$.estimate,
+                                                             C.lm_p = glance(Cubist_reg)$p.value,
+                                                             C.lm_r2 = glance(Cubist_reg)$r.squared, 
+                                                             C.lm_intercept= tidy(Cubist_reg)$estimate[1],
+                                                             C.lm_slope = tidy(Cubist_reg)$estimate[2], 
+                                                             runtime = format(toc, units = 'secs'), 
+                                                             rep = for_rep,
+                                                             objectsize = format(object.size(new_data), units = "Mb"))))
+        
+        
+      }
+    }
+  }
+  
+  ## Write performance metrics matrix to a csv
+  write_csv(performance_metrics_Haar_wet, file.path(results_dir, "NIR_Haar_drypredwet_results_20251117.csv"))
+  
+  ## Write PLSR predictions to csv
+  write_csv(all.Haar.PLSR.drywet.pred, file.path(results_dir, "Haar_drytowet_PLSR_20251117.csv"))
+  
+  ## Write Cubist predictions to csv
+  write_csv(all.Haar.Cubist.drywet.pred, file.path(results_dir, "Haar_drytowet_Cubist_20251117.csv"))
+  
+}
+
+performance_metrics_Haar_wet <- read_csv(file.path(results_dir, "NIR_Haar_drypredwet_results_20251117.csv"))
+
+```
+
+Histogram of performance metrics for dry Haar calibrated and wet predicted NIR 
+scans.
+
+```{r Haar_drywet_metrics_hists}
+
+# Arranging NIR trade-off results for metrics histogram
+Haar_drywet_model_metrics.df <- performance_metrics_Haar_wet %>%
+  pivot_longer(cols = -c(variable, signal, runtime, rep, 
+                         objectsize, Haar_compression_fold), names_to = "metric", 
+               values_to = "performance") %>%
+  mutate(model = case_when(startsWith(metric, "P") ~ 'PLSR', 
+                           TRUE ~ 'Cubist')) %>%
+  mutate(metric = gsub('^P.', '', metric),
+         metric = gsub('^C.', '', metric),
+         metric = gsub('lm_intercept', 'intercept', metric),
+         metric = gsub('lm_slope', 'slope', metric),
+         metric = gsub('lm_p', 'P-value', metric),
+         metric = gsub('lm_r2', 'R squared', metric),
+         metric = gsub('LCCC', "Lin's CCC", metric),
+         #metric = gsub('runtime', "Runtime", metric),
+         variable = gsub('Clay_log', 'Clay [log(%Clay)]', variable),
+         variable = gsub('OC_log', 'OC [log(%OC)]', variable),
+         variable = gsub('pH_log', 'pH-H2O', variable))
+
+# NIR and Haar model cal/val metrics histogram figure
+ggplot(data = Haar_drywet_model_metrics.df %>%
+         filter(metric %in% c("R squared", "Lin's CCC", "RMSE", "RPIQ"))) +
+  geom_histogram(aes(x = performance)) +
+  facet_wrap(variable ~ metric , scales = "free") +
+  labs(x = "Performance Metric Value", y = "") +
+  theme(panel.grid.minor = element_blank(),
+        axis.title.y = element_blank(),
+        axis.title = element_text(size = 13, color = "Black"),
+        axis.text = element_text(size = 13, color = "Black"),
+        strip.background =element_rect(fill="white"),
+        strip.text.x = element_text(size = 13, color = "Black"))
+
+# Saving Haar dry trained wet predicted NIR model val metrics histogram figure
+ggsave("Haar_drywet_ModelVal_perf_hist_20251118.png", width = 12, 
+       height = 12, path = fig_dir, dpi = 300, units = "in")
+
+```
+
+Histogram of performance metrics for dry near-infrared and Haar calibrated, 
+wet predicted properties.
+
+```{r both_drywet_metrics_hists}
+
+# Arranging NIR trade-off results for metrics histogram
+both_drywet_model_metrics.df <- performance_metrics_Haar_wet %>%
+  rbind(read_csv(file.path(
+    results_dir, "wetdry_pred_results_20251117.csv"))) %>%
+  pivot_longer(cols = -c(variable, signal, runtime, rep, 
+                         objectsize, Haar_compression_fold), names_to = "metric", 
+               values_to = "performance") %>%
+  mutate(model = case_when(startsWith(metric, "P") ~ 'PLSR', 
+                           TRUE ~ 'Cubist')) %>%
+  mutate(metric = gsub('^P.', '', metric),
+         metric = gsub('^C.', '', metric),
+         metric = gsub('lm_intercept', 'Intercept', metric),
+         metric = gsub('lm_slope', 'Slope', metric),
+         metric = gsub('lm_p', 'P-value', metric),
+         metric = gsub('lm_r2', 'R squared', metric),
+         metric = gsub('LCCC', "Lin's CCC", metric),
+         #metric = gsub('runtime', "Runtime", metric),
+         variable = gsub('Clay_log', 'Clay [log(%Clay)]', variable),
+         variable = gsub('OC_log', 'OC [log(%OC)]', variable),
+         variable = gsub('pH_log', 'pH-H2O', variable))
+
+# NIR and Haar model cal/val metrics histogram figure
+ggplot(data = both_drywet_model_metrics.df %>%
+         filter(metric %in% c("R squared", "Lin's CCC", "RMSE", "RPIQ",
+                              "Slope","Intercept"))) +
+  geom_histogram(aes(x = performance)) +
+  facet_wrap(variable ~ metric , scales = "free", ncol = 6) +
+  labs(x = "Performance Metric Value", y = "") +
+  theme(panel.grid.minor = element_blank(),
+        axis.title.y = element_blank(),
+        axis.title = element_text(size = 13, color = "Black"),
+        axis.text = element_text(size = 13, color = "Black"),
+        strip.background =element_rect(fill="white"),
+        strip.text.x = element_text(size = 13, color = "Black"))
+
+# Saving Haar dry trained wet predicted NIR model val metrics histogram figure
+ggsave("both_drywet_ModelVal_perf_hist_20251203.png", width = 15, 
+       height = 12, path = fig_dir, dpi = 300, units = "in")
+
+```
+
+## Using subset dry Haar model to predict OC from wet Haar scans
+
+Predicting Haar transformed wet OC with Haar transformed dry trained model.
+
+```{r subset_Haar_dry_predict_wet}
+
+if(!file.exists(file.path(results_dir, 'subset_NIR_Haar_drypredwet_results_20251117.csv'))){
+  
+  ## Setting seed for random selection in calibration/validation split
+  set.seed(222)
+  
+  performance_metrics_Haar_wet <- data.frame()
+  all.Haar.PLSR.drywet.pred <- data.frame()
+  all.Haar.Cubist.drywet.pred <- data.frame()
+  plsr.coef <- list()
+  
+  #for(signal in c('nir', 'Haar')){
+  for(var_name in c('OC_log', 'pH_log', 'Clay_log')){
+    
+    for(signal_compression in 0:8){
+      
+      for(for_rep in 1:30) {
+        
+        signal <- 'Haar'
+        #var_name <- 'OC'  
+        #signal_compression <- 0
+        
+        #new_data <- make_ML_data(variable_name = var_name, 
+        #                         signal_data = signal, 
+        #                         Haar_compression_fold = signal_compression)
+        
+        temp_property <- wet_Lab_data %>%
+          dplyr::select(sample_id, all_of(var_name))
+        
+        if(!is.finite(signal_compression) | signal_compression < 0 | signal_compression > 12){
+          stop('bad compression size')
+        }
+        
+        signal_size <- (ncol(transformed_wet)-2) * (1/2)^signal_compression
+        Haar_index <- 2 + #add the sample_id
+          2:signal_size #skip the final trend (HaarInf_1) -> imposing a high-pass
+        
+        transformed_wet_pass <- transformed_wet[,c(1:2, Haar_index)] %>%
+          select(-kssl_id)
+        
+        new_data <- list(data = temp_property %>%
+                           inner_join(transformed_wet_pass, by = "sample_id"),
+                         metaData = list(variable = var_name, 
+                                         signal = signal, 
+                                         Haar_compression_fold = as.character(signal_compression)))
+        
+        rm(temp_property) # since large data
+        
+        # Preparing for PLSR
+        ## Beginning of tic/toc for run timing and future comparisons
+        tic <- Sys.time()
+        
+        ## Selecting component count as either 20 or number of component columns 
+        ## ...in data
+        # We do not have 20 components here: how many independent variables in 
+        # ...the data frame that we are using for the prediction
+        component_count <- min(20, ncol(new_data$data)-2)
+        
+        ## Splitting data with 80% (4/5) going to training set
+        data_split <- initial_split(new_data$data, prop = 4/5)
+        
+        # Model validation
+        ## Setting tidymodels workflow
+        test_data  <- testing(data_split)
+        
+        recipe_test <- test_data %>%
+          recipe() %>%
+          update_role(everything()) %>%
+          update_role(c("sample_id"), new_role = "id variable") %>%
+          update_role(new_data$metaData$variable, new_role = "outcome") %>%
+          prep()
+        
+        ## PLSR predictions
+        Haar_PLSR_dry_train_model <- readRDS(file.path(models_dir, 
+                                                  paste0(var_name,
+                                                        signal_compression,
+                                                        signal,
+                                                        for_rep,
+                                                        "subset_NIR_dry_train_PLSR.rds",
+                                                          collapse = "_")))
+                                                         
+        pls.model.nir.predictions <- predict(Haar_PLSR_dry_train_model, ncomp = component_count, 
+                                             newdata = list(spectra = juice(recipe_test, composition = "matrix", all_predictors()))) %>%
+          as.data.frame() %>%
+          setNames('plsr_prediction') %>%
+          bind_cols(test_data %>% 
+                      select(all_of(new_data$metaData$variable), sample_id))
+        
+        names(pls.model.nir.predictions) <- c('predicted', 'measured', 'sample_id')
+        
+        # Saving all predicted values for all reps and loops to evaluate spread of 
+        # ...data without effects of linear regression
+        all.Haar.PLSR.drywet.pred <- bind_rows(all.Haar.PLSR.drywet.pred,
+                                                  c(pls.model.nir.predictions,
+                                                    new_data$metaData,
+                                                    list(rep = for_rep)))
+        
+        ## Cubist predictions
+        Haar_Cubist_dry_train_model <- readRDS(file.path(models_dir, 
+                                                  paste0(var_name,
+                                                        signal_compression,
+                                                        signal,
+                                                        for_rep,
+                                                        "subset_NIR_dry_train_Cubist.rds",
+                                                          collapse = "_")))
+        
+        cubist_pred_data <- juice(recipe_test, 
+                                composition = "matrix", all_outcomes()) %>% 
+        cbind(juice(recipe_test, 
+                    composition = "matrix",
+                    all_predictors()))
+      
+      cubist.model.nir.predictions <- predict(Haar_Cubist_dry_train_model, 
+                                        newdata = cubist_pred_data, 
+                                        neighbors = 0) %>%
+        as.data.frame() %>%
+        setNames('cubist_prediction') %>%
+        bind_cols(test_data %>% 
+                    select(all_of(new_data$metaData$variable), sample_id))
+        
+        names(cubist.model.nir.predictions) <- c('predicted', 'measured', 'sample_id')
+        
+        # Saving all predicted values for all reps and loops to evaluate spread of 
+        # ...data without effects of linear regression
+        all.Haar.Cubist.drywet.pred <- bind_rows(all.Haar.Cubist.drywet.pred,
+                                                  c(cubist.model.nir.predictions,
+                                                    new_data$metaData,
+                                                    list(rep = for_rep)))
+        
+        if(!grepl('_log', var_name)){
+          pls.model.nir.predictions <- pls.model.nir.predictions %>%
+            mutate(predicted = log(predicted),
+                   measured = log(measured))
+        }
+        
+        # Evaluation of model performance
+        ## Plot of predicted vs estimated values
+        
+        if(for_rep == 1){
+          
+          ggplot(pls.model.nir.predictions,
+                 aes(x = measured, 
+                     y = predicted)) +
+            geom_hex()  +
+            geom_abline(color = 'red') +
+            labs(x = 'Estimated', 
+                 y = 'Predicted',
+                 title = paste(new_data$metaData$variable, new_data$metaData$signal, 
+                               'at energy', new_data$metaData$energy)) +
+            theme_bw() +
+            theme(panel.background = element_blank(),
+                  panel.grid.major = element_blank(),
+                  axis.title = element_text(size = 13, color = "Black"),
+                  axis.text = element_text(size = 13, color = "Black"),
+                  panel.grid.minor = element_blank())
+          
+          ggsave(sprintf("%s_%s_%s_pred_calc_figure_Haar_drywet.png", 
+                         new_data$metaData$variable, 
+                         new_data$metaData$signal, 
+                         new_data$metaData$Haar_compression_fold), 
+                 width = 6, height = 6, 
+                 path = fig_dir, dpi = 300, units = "in")
+          
+        }
+        
+        ## Linear regression
+      PLSR_reg <- lm(formula = predicted ~ measured,
+                     data = pls.model.nir.predictions)
+      
+      Cubist_reg <- lm(formula = predicted ~ measured,
+                       data = cubist.model.nir.predictions)
+      
+      ## RMSE calculation
+      PLSR_RMSE <- with(pls.model.nir.predictions, 
+                        sqrt(sum((predicted - measured)^2, na.rm=TRUE) / 
+                               sum(is.finite(measured + predicted))))
+      
+      Cubist_RMSE <- with(cubist.model.nir.predictions, 
+                          sqrt(sum((predicted - measured)^2, na.rm=TRUE) / 
+                                 sum(is.finite(measured + predicted))))
+      
+      ## Lin's CCC calculation
+      PLSR_LCCC <- ccc(data = pls.model.nir.predictions, truth = measured, 
+                       estimate = predicted)
+      
+      Cubist_LCCC <- ccc(data = cubist.model.nir.predictions, truth = measured, 
+                         estimate = predicted)
+      
+      ## RPIQ calculation
+      PLSR_RPIQ <- rpiq(data = pls.model.nir.predictions, truth = measured, 
+                        estimate = predicted)
+      
+      Cubist_RPIQ <- rpiq(data = cubist.model.nir.predictions, truth = measured, 
+                          estimate = predicted)
+      
+      ## End of tic/toc for run timing and future comparisons
+      toc <- Sys.time() - tic
+      print(toc)
+      
+      ## Adding performance metrics to performance_metrics df
+      performance_metrics_Haar_wet <- bind_rows(performance_metrics_Haar_wet,
+                                                  c(new_data$metaData, 
+                                                        list(P.RMSE = PLSR_RMSE, 
+                                                             P.LCCC = PLSR_LCCC$.estimate,
+                                                             P.RPIQ = PLSR_RPIQ$.estimate,
+                                                             P.lm_p = glance(PLSR_reg)$p.value,
+                                                             P.lm_r2 = glance(PLSR_reg)$r.squared, 
+                                                             P.lm_intercept= tidy(PLSR_reg)$estimate[1],
+                                                             P.lm_slope = tidy(PLSR_reg)$estimate[2], 
+                                                             C.RMSE = Cubist_RMSE, 
+                                                             C.LCCC = Cubist_LCCC$.estimate,
+                                                             C.RPIQ = Cubist_RPIQ$.estimate,
+                                                             C.lm_p = glance(Cubist_reg)$p.value,
+                                                             C.lm_r2 = glance(Cubist_reg)$r.squared, 
+                                                             C.lm_intercept= tidy(Cubist_reg)$estimate[1],
+                                                             C.lm_slope = tidy(Cubist_reg)$estimate[2], 
+                                                             runtime = format(toc, units = 'secs'), 
+                                                             rep = for_rep,
+                                                             objectsize = format(object.size(new_data), units = "Mb"))))
+        
+        
+      }
+    }
+  }
+  
+  ## Write performance metrics matrix to a csv
+  write_csv(performance_metrics_Haar_wet, file.path(results_dir, "subset_NIR_Haar_drypredwet_results_20251117.csv"))
+  
+  ## Write PLSR predictions to csv
+  write_csv(all.Haar.PLSR.drywet.pred, file.path(results_dir, "subset_Haar_drytowet_PLSR_20251117.csv"))
+  
+  ## Write Cubist predictions to csv
+  write_csv(all.Haar.Cubist.drywet.pred, file.path(results_dir, "subset_Haar_drytowet_Cubist_20251117.csv"))
+  
+}
+
+subset_performance_metrics_Haar_wet <- read_csv(file.path(results_dir, "subset_NIR_Haar_drypredwet_results_20251117.csv"))
+
+```
+
+Histogram of performance metrics for subset dry Haar calibrated and wet 
+predicted NIR scans.
+
+```{r subset_Haar_drywet_metrics_hists}
+
+# Arranging NIR trade-off results for metrics histogram
+subHaar_drywet_model_metrics.df <- subset_performance_metrics_Haar_wet %>%
+  pivot_longer(cols = -c(variable, signal, runtime, rep, 
+                         objectsize, Haar_compression_fold), names_to = "metric", 
+               values_to = "performance") %>%
+  mutate(model = case_when(startsWith(metric, "P") ~ 'PLSR', 
+                           TRUE ~ 'Cubist')) %>%
+  mutate(metric = gsub('^P.', '', metric),
+         metric = gsub('^C.', '', metric),
+         metric = gsub('lm_intercept', 'intercept', metric),
+         metric = gsub('lm_slope', 'slope', metric),
+         metric = gsub('lm_p', 'P-value', metric),
+         metric = gsub('lm_r2', 'R squared', metric),
+         metric = gsub('LCCC', "Lin's CCC", metric),
+         #metric = gsub('runtime', "Runtime", metric),
+         variable = gsub('Clay_log', 'Clay [log(%Clay)]', variable),
+         variable = gsub('OC_log', 'OC [log(%OC)]', variable),
+         variable = gsub('pH_log', 'pH-H2O', variable))
+
+# NIR and Haar model cal/val metrics histogram figure
+ggplot(data = subHaar_drywet_model_metrics.df %>%
+         filter(metric %in% c("R squared", "Lin's CCC", "RMSE", "RPIQ"))) +
+  geom_histogram(aes(x = performance)) +
+  facet_wrap(variable ~ metric , scales = "free") +
+  labs(x = "Performance Metric Value", y = "") +
+  theme(panel.grid.minor = element_blank(),
+        axis.title.y = element_blank(),
+        axis.title = element_text(size = 13, color = "Black"),
+        axis.text = element_text(size = 13, color = "Black"),
+        strip.background =element_rect(fill="white"),
+        strip.text.x = element_text(size = 13, color = "Black"))
+
+# Saving subset Haar dry trained wet predicted NIR model val metrics histogram
+# ...figure
+ggsave("subset_Haar_drywet_ModelVal_perf_hist_20251118.png", width = 12, 
+       height = 12, path = fig_dir, dpi = 300, units = "in")
+
+```
+
+Histogram of performance metrics for subset dry Haar calibrated and wet 
+predicted NIR scans.
+
+```{r both_subset_drywet_metrics_hists}
+
+# Arranging NIR trade-off results for metrics histogram
+both_subset_drywet_model_metrics.df <- subset_performance_metrics_Haar_wet %>%
+  rbind(read_csv(file.path(
+    results_dir, "subset_wetdry_pred_results_20251117.csv"))) %>%
+  pivot_longer(cols = -c(variable, signal, runtime, rep, 
+                         objectsize, Haar_compression_fold), names_to = "metric", 
+               values_to = "performance") %>%
+  mutate(model = case_when(startsWith(metric, "P") ~ 'PLSR', 
+                           TRUE ~ 'Cubist')) %>%
+  mutate(metric = gsub('^P.', '', metric),
+         metric = gsub('^C.', '', metric),
+         metric = gsub('lm_intercept', 'Intercept', metric),
+         metric = gsub('lm_slope', 'Slope', metric),
+         metric = gsub('lm_p', 'P-value', metric),
+         metric = gsub('lm_r2', 'R squared', metric),
+         metric = gsub('LCCC', "Lin's CCC", metric),
+         #metric = gsub('runtime', "Runtime", metric),
+         variable = gsub('Clay_log', 'Clay [log(%Clay)]', variable),
+         variable = gsub('OC_log', 'OC [log(%OC)]', variable),
+         variable = gsub('pH_log', 'pH-H2O', variable))
+
+# NIR and Haar model cal/val metrics histogram figure
+ggplot(data = both_subset_drywet_model_metrics.df %>%
+         filter(metric %in% c("R squared", "Lin's CCC", "RMSE", "RPIQ",
+                              "Slope", "Intercept"))) +
+  geom_histogram(aes(x = performance)) +
+  facet_wrap(variable ~ metric , scales = "free", ncol = 6) +
+  labs(x = "Performance Metric Value", y = "") +
+  theme(panel.grid.minor = element_blank(),
+        axis.title.y = element_blank(),
+        axis.title = element_text(size = 13, color = "Black"),
+        axis.text = element_text(size = 13, color = "Black"),
+        strip.background =element_rect(fill="white"),
+        strip.text.x = element_text(size = 13, color = "Black"))
+
+# Saving subset Haar dry trained wet predicted NIR model val metrics histogram
+# ...figure
+ggsave("both_subset_drywet_ModelVal_perf_hist_20251203.png", width = 15, 
+       height = 12, path = fig_dir, dpi = 300, units = "in")
+
+```
