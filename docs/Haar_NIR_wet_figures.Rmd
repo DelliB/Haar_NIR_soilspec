@@ -1,0 +1,625 @@
+---
+title: "NIR and Haar wet sample predictions"
+author:
+- D Bloom <develyn.bloom@ufl.edu>, University of Florida
+- "K Todd-Brown <ktoddbrown@ufl.edu>, University of Florida"
+date: "Summer 2025"
+output:
+  pdf_document:
+    toc: true
+  html_document:
+    toc: true
+  word_document:
+    toc: true
+---
+
+# Setting up environment
+## Libraries
+
+Loading libraries.
+
+```{r setup, include=FALSE}
+
+# Load tidyverse for many functions
+library(tidyverse)
+# Load to arrange plots for PLSR results
+library(ggpubr)
+# Load knitr to design and render results table 
+library(knitr)
+
+```
+
+## Directories
+
+Setting directories.
+
+```{r dir_setup, include=FALSE}
+
+# Root directory for outputs
+rootDir <- '.'
+
+## Figure output directory
+fig_dir <- file.path(rootDir, 'Figures/')
+
+## Results output directory
+results_dir <- file.path(rootDir, 'Perf_results')
+
+```
+
+# Sample wetness
+
+## Organizing results
+
+Organizing NIR results data from sample wetness analysis for figure code below.
+
+```{r wet_data}
+
+# Load dry calibrated wet predicted data - add filter for Haar levels if 
+# ...applicable when loading each sample wetness results dataframe
+perf_dry4wet <- read_csv(file.path(results_dir, 
+                                   'wetdry_pred_results_20251117.csv')) %>%
+  #filter(Haar_compression_fold == 4) %>%
+  bind_rows(read_csv(file.path(results_dir, 
+                                  'NIR_Haar_drypredwet_results_20251117.csv'))) %>%
+  mutate(training = "dry calibrated\nwet predicted")
+
+# Load wet calibrated wet predicted data
+perf_wet4wet <- read_csv(file.path(results_dir, 
+                                  'NIR_wet_train_results_20251117.csv')) %>%
+  #filter(Haar_compression_fold == 4) %>%
+  bind_rows(read_csv(file.path(results_dir, 
+                                  'NIR_wet_Haarmodel_cal_results_20251117.csv'))) %>%
+  mutate(training = "wet calibrated\nwet predicted")
+
+# Load subset dry calibrated wet predicted data
+perf_subdry4wet <- read_csv(file.path(results_dir, 
+                                  'subset_wetdry_pred_results_20251117.csv')) %>%
+  #filter(Haar_compression_fold == 4) %>%
+  bind_rows(
+    read_csv(file.path(results_dir,
+                       'subset_NIR_Haar_drypredwet_results_20251117.csv'))) %>%
+  mutate(training = "subset dry calibrated\nwet predicted")
+
+# Merge sample wetness data and define signal sizes for cleaner plots below
+wet_perf.df <- perf_dry4wet %>%
+  rbind(perf_wet4wet) %>%
+  rbind(perf_subdry4wet) %>%
+  dplyr::mutate(signal_def = ifelse(signal == 'nir', 'NIR', signal),
+         signal_def = ifelse(Haar_compression_fold == '0' & signal == 'Haar', 
+                             'Full Haar', signal_def),
+         signal_def = ifelse(Haar_compression_fold == '1' & signal == 'Haar', 
+                             '100% Haar', signal_def),
+         signal_def = ifelse(Haar_compression_fold == '2' & signal == 'Haar', 
+                             '50% Haar', signal_def),
+         signal_def = ifelse(Haar_compression_fold == '3' & signal == 'Haar', 
+                             '25% Haar', signal_def),
+         signal_def = ifelse(Haar_compression_fold == '4' & signal == 'Haar', 
+                             '12% Haar', signal_def),
+         signal_def = ifelse(Haar_compression_fold == '5' & signal == 'Haar', 
+                             '6.0% Haar', signal_def),
+         signal_def = ifelse(Haar_compression_fold == '6' & signal == 'Haar', 
+                             '3.0% Haar', signal_def),
+         signal_def = ifelse(Haar_compression_fold == '7' & signal == 'Haar', 
+                             '1.0% Haar', signal_def),
+         signal_def = ifelse(Haar_compression_fold == '8'  & signal == 'Haar', 
+                             '0.5% Haar', signal_def))
+
+# Converting signal size to factor for ordering in plot
+wet_perf.df$signal_def <- factor(wet_perf.df$signal_def,
+                                 labels = c("0.5% Haar", "1.0% Haar", 
+                                            "3.0% Haar",  "6.0% Haar", 
+                                            "12% Haar", "25% Haar", 
+                                            "50% Haar", "100% Haar", 
+                                            "Full Haar", "NIR"))
+
+# Ensuring PLSR and Cubist metrics are separated by row and not column
+wet_perf_fig.df <- wet_perf.df %>%
+  pivot_longer(cols = -c(variable, signal, Haar_compression_fold, runtime, rep, 
+                         objectsize, training, signal_def), 
+               names_to = "metric", 
+               values_to = "performance") %>%
+  mutate(model = case_when(startsWith(metric, "P") ~ 'PLSR', 
+                           TRUE ~ 'Cubist')) %>%
+  dplyr::mutate(metric = gsub('^P.', '', metric),
+         metric = gsub('^C.', '', metric),
+         metric = gsub('lm_intercept', 'intercept', metric),
+         metric = gsub('lm_slope', 'slope', metric),
+         metric = gsub('lm_p', 'P-value', metric),
+         metric = gsub('lm_r2', 'R squared', metric),
+         metric = gsub('LCCC', "Lin's CCC", metric),
+         #metric = gsub('runtime', "Runtime", metric),
+         variable = gsub('Clay_log', 'Clay [log(%)]', variable),
+         variable = gsub('OC_log', 'OC [log(%)]', variable),
+         variable = gsub('pH_log', 'pH-H2O', variable))
+
+```
+
+## Figures
+
+Visualizing results from model trained on dry and predicting wet data and 
+trained on wet predicting wet through organic carbon, clay, and pH for R 
+squared and LCCC.
+
+```{r wet_facets_fig}
+
+# Plot for wet predict wet and dry predict wet with facets through properties 
+# ...and coloring by calibration and validation data combinations
+## PLSR facet
+PLSR_wet <- ggplot(data = wet_perf_fig.df %>% 
+                 filter(model == "PLSR") %>%
+                 filter(metric != "P-value" & metric != "intercept" & 
+                          metric != "slope" & metric != "RMSE" & 
+                          metric != "R squared") %>%
+                 filter(training == "dry calibrated\nwet predicted" | 
+                          training == "wet calibrated\nwet predicted" |
+                          training == "subset dry calibrated\nwet predicted"),
+               aes(y = signal_def, x = performance, 
+                   color = training)) +
+  geom_boxplot(position = position_dodge(width = 0.8)) +
+  labs(x = "Performance Metric Value", y = "", color = "") +
+  #facet_grid(metric ~ variable, scales = "free_x") +
+  facet_wrap(metric ~ variable, scales = "free_x", axes = "all_x") +
+  theme_bw() +
+  theme(legend.position = "top",
+        legend.background = element_rect(fill = "transparent"),
+        legend.key = element_rect(fill = "transparent"),
+        #legend.margin = margin(-0.4,0,0,0, unit="cm"),
+        panel.background = element_blank(),
+        panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(),
+        axis.title = element_text(size = 13, color = "Black"),
+        axis.text.x = element_text(size = 13, color = "Black"),
+        axis.text.y = element_text(size = 12, color = "Black"),
+        #axis.title.x = element_blank(),
+        #legend.title = element_text(size = 13, color = "Black"),
+        legend.text = element_text(size = 13, color = "Black"),
+        strip.background = element_rect(fill = "white"),
+        strip.text = element_text(size = 13, color = "Black"),
+        strip.placement = "outside") +
+  scale_y_discrete(limits = c("0.5% Haar", "1.0% Haar", "3.0% Haar", 
+                              "6.0% Haar", "12% Haar", "25% Haar", "50% Haar",
+                              "100% Haar", "Full Haar", "NIR")) +
+  scale_color_manual(values = c("red3", "forestgreen", "royalblue3")) +
+  #scale_color_manual(values=c("mediumpurple1", "palevioletred1", "turquoise3")) +
+  theme(legend.background = element_rect(fill = "transparent"),
+        legend.key = element_rect(colour = NA, fill = NA),
+        legend.box.background = element_blank())
+
+# Save PLSR sample wetness plot separately
+ggsave("PLSR_wet_facets_20260129.png", width = 8, height = 7, 
+       path = fig_dir, dpi = 300, units = "in")
+
+## Cubist facet
+Cubist_wet <- ggplot(data = wet_perf_fig.df %>% 
+                       filter(model == "Cubist") %>%
+                       filter(metric != "P-value" & metric != "intercept" & 
+                                metric != "slope" & metric != "RMSE" & 
+                                metric != "R squared") %>%
+                       filter(training == "dry calibrated\nwet predicted" | 
+                                training == "wet calibrated\nwet predicted"|
+                                training == "subset dry calibrated\nwet predicted"),
+                     aes(y = signal_def, x = performance, 
+                         color = training)) +
+  geom_boxplot(position = position_dodge(width = 0.8)) +
+  labs(x = "Performance Metric Value", y = "", color = "") +
+  #facet_grid(metric ~ variable, scales = "free_x") +
+  facet_wrap(metric ~ variable, scales = "free_x", axes = "all_x") +
+  theme_bw() +
+  theme(legend.position = "top",
+        #legend.position = "none",
+        legend.background = element_rect(fill = "transparent"),
+        legend.key = element_rect(fill = "transparent"),
+        #legend.margin = margin(-0.4,0,0,0, unit="cm"),
+        panel.background = element_blank(),
+        panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(),
+        axis.title = element_text(size = 13, color = "Black"),
+        axis.text.x = element_text(size = 13, color = "Black"),
+        axis.text.y = element_text(size = 12, color = "Black"),
+        #axis.title.x = element_blank(),
+        #legend.title = element_text(size = 13, color = "Black"),
+        legend.text = element_text(size = 13, color = "Black"),
+        strip.background =element_rect(fill="white"),
+        strip.text = element_text(size = 13, color = "Black")) +
+  scale_y_discrete(limits = c("0.5% Haar", "1.0% Haar", "3.0% Haar", 
+                              "6.0% Haar", "12% Haar", "25% Haar", "50% Haar",
+                              "100% Haar", "Full Haar", "NIR")) +
+  scale_color_manual(values = c("red3", "forestgreen", "royalblue3")) +
+  theme(legend.background = element_rect(fill = "transparent"),
+        legend.key = element_rect(colour = NA, fill = NA),
+        legend.box.background = element_blank())
+
+# Save Cubist sample wetness plot separately
+ggsave("Cubist_wet_facets_20260129.png", width = 8, height = 7, 
+       path = fig_dir, dpi = 300, units = "in")
+
+# Arranging PLSR and Cubist plots
+ggarrange(PLSR_wet, Cubist_wet, nrow = 2, labels = c("a","b"))
+
+# Save sample wetness arranged plot
+ggsave("Wet_facets_20260129.png", width = 9, height = 9, 
+       path = fig_dir, dpi = 300, units = "in")
+
+```
+
+## Table
+
+Table to display metric median and ranges for ease in results reporting.
+
+```{r wetness_table, eval = F}
+
+# Table for PLSR wetness analysis results summary
+PLSR_table.df <- wet_perf_fig.df %>%
+  pivot_wider(names_from = "metric", values_from = "performance") %>%
+  rename(LCCC = "Lin's CCC",
+         R_2 = "R squared") %>%
+  filter(model == "PLSR") %>%
+  reframe(median_LCCC = quantile(LCCC, .5), 
+          LCCC_05 = quantile(LCCC, .05),
+          LCCC_95 = quantile(LCCC, .95),
+          median_RMSE = quantile(RMSE, .5), 
+          RMSE_05 = quantile(RMSE, .05),
+          RMSE_95 = quantile(RMSE, .95),
+          median_R2 = quantile(R_2, .5), 
+          R2_05 = quantile(R_2, .05),
+          R2_95 = quantile(R_2, .95),
+          median_RPIQ = quantile(RPIQ, .5), 
+          RPIQ_05 = quantile(RPIQ, .05),
+          RPIQ_95 = quantile(RPIQ, .95),
+          n = n(),
+         .by = c(variable, signal_def, training)) %>%
+  arrange(training, variable, desc(signal_def))
+
+# Changing training names in PLSR results so they do not enter new table line
+PLSR_table.df$training[PLSR_table.df$training == 
+                         "dry calibrated\nwet predicted"] <- 
+  "dry calibrated wet predicted"
+
+PLSR_table.df$training[PLSR_table.df$training == 
+                         "subset dry calibrated\nwet predicted"] <- 
+  "subset dry calibrated wet predicted"
+
+PLSR_table.df$training[PLSR_table.df$training == 
+                         "wet calibrated\nwet predicted"] <- 
+  "wet calibrated wet predicted"
+
+# Table for Cubist wetness analysis results summary
+Cubist_table.df <- wet_perf_fig.df %>%
+  pivot_wider(names_from = "metric", values_from = "performance") %>%
+  rename(LCCC = "Lin's CCC",
+         R_2 = "R squared") %>%
+  filter(model == "Cubist") %>%
+  reframe(median_LCCC = quantile(LCCC, .5), 
+          LCCC_05 = quantile(LCCC, .05),
+          LCCC_95 = quantile(LCCC, .95),
+          median_RMSE = quantile(RMSE, .5), 
+          RMSE_05 = quantile(RMSE, .05),
+          RMSE_95 = quantile(RMSE, .95),
+          median_R2 = quantile(R_2, .5), 
+          R2_05 = quantile(R_2, .05),
+          R2_95 = quantile(R_2, .95),
+          median_RPIQ = quantile(RPIQ, .5), 
+          RPIQ_05 = quantile(RPIQ, .05),
+          RPIQ_95 = quantile(RPIQ, .95),
+          n = n(),
+         .by = c(variable, signal_def, training)) %>%
+  arrange(training, variable, desc(signal_def))
+
+# Changing training names in Cubist results so they do not enter new table line
+Cubist_table.df$training[Cubist_table.df$training == 
+                         "dry calibrated\nwet predicted"] <- 
+  "dry calibrated wet predicted"
+
+Cubist_table.df$training[Cubist_table.df$training == 
+                         "subset dry calibrated\nwet predicted"] <- 
+  "subset dry calibrated wet predicted"
+
+Cubist_table.df$training[Cubist_table.df$training == 
+                         "wet calibrated\nwet predicted"] <- 
+  "wet calibrated wet predicted"
+kable(Cubist_table.df)
+# Rendering table
+kable(list(PLSR_table.df, Cubist_table.df))
+
+```
+
+# Appendix - Compression vs Accuracy
+
+## Organizing full results
+
+Organizing full NIR tradeoff results data for figure code below.
+
+```{r NIR_tradeoff_data}
+
+NIR_tradeoff <- read_csv(file.path(
+  results_dir, "NIR_tradeoff_20251117.csv")) %>%
+  mutate(analysis = 'NIR')
+
+tradeoff.df <- NIR_tradeoff %>%
+         mutate(signal_def = ifelse(signal == 'NIR', 'NIR', signal),
+         signal_def = ifelse(signal_compression == '0' & signal == 'Haar', 'Full Haar', 
+                             signal_def),
+         signal_def = ifelse(signal_compression == '1', '100% Haar', 
+                             signal_def),
+         signal_def = ifelse(signal_compression == '2', '50% Haar', 
+                             signal_def),
+         signal_def = ifelse(signal_compression == '3', '25% Haar', 
+                             signal_def),
+         signal_def = ifelse(signal_compression == '4', '12% Haar', 
+                             signal_def),
+         signal_def = ifelse(signal_compression == '5', '6.0% Haar', 
+                             signal_def),
+         signal_def = ifelse(signal_compression == '6', '3.0% Haar', 
+                             signal_def),
+         signal_def = ifelse(signal_compression == '7', '1.0% Haar', 
+                             signal_def),
+         signal_def = ifelse(signal_compression == '8', '0.5% Haar', 
+                             signal_def)) %>%
+  mutate(runtime = as.numeric(gsub(" secs|mins", "", runtime))) %>%
+  pivot_longer(cols = -c(variable, signal, signal_compression, runtime, rep, 
+                         objectsize, analysis, signal_def), names_to = "metric", 
+               values_to = "performance") %>%
+  mutate(model = case_when(startsWith(metric, "P") ~ 'PLSR', 
+                           TRUE ~ 'Cubist')) %>%
+  mutate(metric = gsub('^P.', '', metric),
+         metric = gsub('^C.', '', metric),
+         metric = gsub('lm_intercept', 'intercept', metric),
+         metric = gsub('lm_slope', 'slope', metric),
+         metric = gsub('lm_p', 'P-value', metric),
+         metric = gsub('lm_r2', 'R squared', metric),
+         metric = gsub('LCCC', "Lin's CCC", metric),
+         #metric = gsub('runtime', "Runtime", metric),
+         variable = gsub('Clay_log', 'Clay [log(%)]', variable),
+         variable = gsub('OC_log', 'OC [log(%)]', variable),
+         variable = gsub('pH_log', 'pH-H2O', variable)) %>%
+  filter(metric != "P-value" & metric != "intercept" & metric != "slope")
+
+```
+
+## Organizing subset results
+
+Organizing subset NIR tradeoff results data for figure code below. Subset are 
+overlap scans from the wet sample dataset.
+
+```{r subsetNIR_tradeoff_data}
+
+subsetNIR_tradeoff <- read_csv(file.path(
+  results_dir, "subset_NIR_tradeoff_20251114.csv")) %>%
+  mutate(analysis = 'subset NIR')
+
+subsettradeoff.df <- subsetNIR_tradeoff %>%
+         mutate(signal_def = ifelse(signal == 'NIR', 'NIR', signal),
+         signal_def = ifelse(signal_compression == '0' & signal == 'Haar', 'Full Haar', 
+                             signal_def),
+         signal_def = ifelse(signal_compression == '1', '100% Haar', 
+                             signal_def),
+         signal_def = ifelse(signal_compression == '2', '50% Haar', 
+                             signal_def),
+         signal_def = ifelse(signal_compression == '3', '25% Haar', 
+                             signal_def),
+         signal_def = ifelse(signal_compression == '4', '12% Haar', 
+                             signal_def),
+         signal_def = ifelse(signal_compression == '5', '6.0% Haar', 
+                             signal_def),
+         signal_def = ifelse(signal_compression == '6', '3.0% Haar', 
+                             signal_def),
+         signal_def = ifelse(signal_compression == '7', '1.0% Haar', 
+                             signal_def),
+         signal_def = ifelse(signal_compression == '8', '0.5% Haar', 
+                             signal_def)) %>%
+  mutate(runtime = as.numeric(gsub(" secs|mins", "", runtime))) %>%
+  pivot_longer(cols = -c(variable, signal, signal_compression, runtime, rep, 
+                         objectsize, analysis, signal_def), names_to = "metric", 
+               values_to = "performance") %>%
+  mutate(model = case_when(startsWith(metric, "P") ~ 'PLSR', 
+                           TRUE ~ 'Cubist')) %>%
+  mutate(metric = gsub('^P.', '', metric),
+         metric = gsub('^C.', '', metric),
+         metric = gsub('lm_intercept', 'intercept', metric),
+         metric = gsub('lm_slope', 'slope', metric),
+         metric = gsub('lm_p', 'P-value', metric),
+         metric = gsub('lm_r2', 'R squared', metric),
+         metric = gsub('LCCC', "Lin's CCC", metric),
+         #metric = gsub('runtime', "Runtime", metric),
+         variable = gsub('Clay_log', 'Clay [log(%)]', variable),
+         variable = gsub('OC_log', 'OC [log(%)]', variable),
+         variable = gsub('pH_log', 'pH-H2O', variable)) %>%
+  filter(metric != "P-value" & metric != "intercept" & metric != "slope")
+
+# Binding rows from the full NIR tradeoff and subset NIR tradeoff results for 
+# ...figure below
+both_tradeoff.df <- tradeoff.df %>%
+  rbind(subsettradeoff.df)
+
+```
+
+## Figures
+
+Facets for NIR trade-off analyses through 4 properties.
+
+```{r NIR_tradeoff_fig}
+
+# Converting metrics to factor for ordering in plot
+both_tradeoff.df$metric <- factor(both_tradeoff.df$metric,
+                                      levels=c("Lin's CCC", "R squared",
+                                               "RPIQ", "RMSE"))
+
+PLSR <- ggplot(data = both_tradeoff.df %>%
+                 filter(model == 'PLSR'),
+       aes(y = signal_def, x = performance, color = variable)) +
+  geom_boxplot() +
+  labs(x = "", y = "", color = "") +
+  facet_grid(analysis ~ metric, scales = "free_x") +
+  theme_bw() +
+  theme(legend.position = "none",
+        legend.background = element_rect(fill = "transparent"),
+        legend.key = element_rect(fill = "transparent"),
+        #legend.margin = margin(-0.4,0,0,0, unit="cm"),
+        panel.background = element_blank(),
+        panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(),
+        axis.title = element_text(size = 13, color = "Black"),
+        axis.title.x = element_blank(),
+        axis.text = element_text(size = 13, color = "Black"),
+        #axis.text.x = element_text(angle = 90, hjust=1),
+        #legend.title = element_text(size = 13, color = "Black"),
+        legend.text = element_text(size = 13, color = "Black"),
+        strip.background =element_rect(fill="white"),
+        strip.text = element_text(size = 13, color = "Black"),
+        panel.spacing = unit(4, "mm")) +
+  scale_y_discrete(limits = c("0.5% Haar", "1.0% Haar", "3.0% Haar", 
+                              "6.0% Haar", "12% Haar", "25% Haar", "50% Haar",
+                              "100% Haar", "Full Haar", "NIR")) +
+  scale_x_continuous(labels = scales::number_format(accuracy = .1)) +
+  scale_color_manual(values=c("#F8766D", "#00BA38", "#619CFF"))
+
+Cubist <- ggplot(data = both_tradeoff.df %>%
+                 filter(model == 'Cubist'),
+       aes(y = signal_def, x = performance, color = variable)) +
+  geom_boxplot() +
+  labs(x = "", y = "", color = "") +
+  facet_grid(analysis ~ metric, scales = "free_x") +
+  theme_bw() +
+  theme(legend.position = c(.095,.94),
+        #legend.background = element_rect(fill = "transparent"),
+        #legend.box.background = element_blank(),
+        legend.key = element_rect(fill = "transparent"),
+        #legend.margin = margin(-0.4,0,0,0, unit="cm"),
+        panel.background = element_blank(),
+        panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(),
+        axis.title = element_text(size = 13, color = "Black"),
+        axis.title.x = element_blank(),
+        axis.text = element_text(size = 13, color = "Black"),
+        #axis.text.x = element_text(angle = 90, hjust=1),
+        #legend.title = element_text(size = 13, color = "Black"),
+        legend.text = element_text(size = 13, color = "Black"),
+        strip.background =element_rect(fill="white"),
+        strip.text = element_text(size = 13, color = "Black"),
+        panel.spacing = unit(4, "mm")) +
+  scale_y_discrete(limits = c("0.5% Haar", "1.0% Haar", "3.0% Haar", 
+                              "6.0% Haar", "12% Haar", "25% Haar", "50% Haar",
+                              "100% Haar", "Full Haar", "NIR")) +
+  scale_color_manual(values=c("#F8766D", "#00BA38", "#619CFF")) +
+  scale_x_continuous(labels = scales::number_format(accuracy = .1)) +
+  theme(legend.background = element_rect(fill = "transparent"),
+        legend.key = element_rect(colour = NA, fill = NA),
+        legend.box.background = element_blank())
+
+ggarrange(PLSR, Cubist, nrow = 2, labels = c("a","b"))
+
+ggsave("NIR_tradeoff_facets_20260129.png", width = 9.5, height = 11, 
+       path = fig_dir, dpi = 300, units = "in")
+
+```
+
+## Full NIR tradeoff table
+
+Table to display metric median and ranges for ease in results reporting.
+
+```{r NIR_tradeoff_table, eval = F}
+
+# Table for PLSR trade-off analysis results summary
+PLSR_table.df <- tradeoff.df %>%
+  pivot_wider(names_from = "metric", values_from = "performance") %>%
+  rename(LCCC = "Lin's CCC",
+         R_2 = "R squared") %>%
+  filter(model == "PLSR") %>%
+  reframe(median_LCCC = quantile(LCCC, .5), 
+          LCCC_05 = quantile(LCCC, .05),
+          LCCC_95 = quantile(LCCC, .95),
+          median_RMSE = quantile(RMSE, .5), 
+          RMSE_05 = quantile(RMSE, .05),
+          RMSE_95 = quantile(RMSE, .95),
+          median_R2 = quantile(R_2, .5), 
+          R2_05 = quantile(R_2, .05),
+          R2_95 = quantile(R_2, .95),
+          median_RPIQ = quantile(RPIQ, .5), 
+          RPIQ_05 = quantile(RPIQ, .05),
+          RPIQ_95 = quantile(RPIQ, .95),
+          n = n(),
+         .by = c(variable, signal_def, model)) %>%
+  arrange(variable)
+
+# Table for Cubist trade-off analysis results summary
+Cubist_table.df <- tradeoff.df %>%
+  pivot_wider(names_from = "metric", values_from = "performance") %>%
+  rename(LCCC = "Lin's CCC",
+         R_2 = "R squared") %>%
+  filter(model == "Cubist") %>%
+  reframe(median_LCCC = quantile(LCCC, .5), 
+          LCCC_05 = quantile(LCCC, .05),
+          LCCC_95 = quantile(LCCC, .95),
+          median_RMSE = quantile(RMSE, .5), 
+          RMSE_05 = quantile(RMSE, .05),
+          RMSE_95 = quantile(RMSE, .95),
+          median_R2 = quantile(R_2, .5), 
+          R2_05 = quantile(R_2, .05),
+          R2_95 = quantile(R_2, .95),
+          median_RPIQ = quantile(RPIQ, .5), 
+          RPIQ_05 = quantile(RPIQ, .05),
+          RPIQ_95 = quantile(RPIQ, .95),
+          n = n(),
+         .by = c(variable, signal_def, model)) %>%
+  arrange(variable)
+
+# Rendering table
+kable(list(PLSR_table.df, Cubist_table.df))
+
+```
+
+## Subset NIR tradeoff table
+
+Table to display metric median and ranges for ease in results reporting.
+
+```{r subNIR_tradeoff_table, eval = F}
+
+# Table for PLSR subset trade-off analysis results summary
+PLSR_table.df <- subsettradeoff.df %>%
+  pivot_wider(names_from = "metric", values_from = "performance") %>%
+  rename(LCCC = "Lin's CCC",
+         R_2 = "R squared") %>%
+  filter(model == "PLSR") %>%
+  reframe(median_LCCC = quantile(LCCC, .5), 
+          LCCC_05 = quantile(LCCC, .05),
+          LCCC_95 = quantile(LCCC, .95),
+          median_RMSE = quantile(RMSE, .5), 
+          RMSE_05 = quantile(RMSE, .05),
+          RMSE_95 = quantile(RMSE, .95),
+          median_R2 = quantile(R_2, .5), 
+          R2_05 = quantile(R_2, .05),
+          R2_95 = quantile(R_2, .95),
+          median_RPIQ = quantile(RPIQ, .5), 
+          RPIQ_05 = quantile(RPIQ, .05),
+          RPIQ_95 = quantile(RPIQ, .95),
+          n = n(),
+         .by = c(variable, signal_def, model)) %>%
+  arrange(variable)
+
+# Table for Cubist subset trade-off analysis results summary
+Cubist_table.df <- subsettradeoff.df %>%
+  pivot_wider(names_from = "metric", values_from = "performance") %>%
+  rename(LCCC = "Lin's CCC",
+         R_2 = "R squared") %>%
+  filter(model == "Cubist") %>%
+  reframe(median_LCCC = quantile(LCCC, .5), 
+          LCCC_05 = quantile(LCCC, .05),
+          LCCC_95 = quantile(LCCC, .95),
+          median_RMSE = quantile(RMSE, .5), 
+          RMSE_05 = quantile(RMSE, .05),
+          RMSE_95 = quantile(RMSE, .95),
+          median_R2 = quantile(R_2, .5), 
+          R2_05 = quantile(R_2, .05),
+          R2_95 = quantile(R_2, .95),
+          median_RPIQ = quantile(RPIQ, .5), 
+          RPIQ_05 = quantile(RPIQ, .05),
+          RPIQ_95 = quantile(RPIQ, .95),
+          n = n(),
+         .by = c(variable, signal_def, model)) %>%
+  arrange(variable)
+
+# Rendering table
+kable(list(PLSR_table.df, Cubist_table.df))
+
+```
+
