@@ -269,6 +269,36 @@ wet_Lab_data <- wet_train_data %>%
 
 ```
 
+Plotting out wet lab data.
+
+```{r Wet_lab_vis}
+
+NIR_wet_hist.df <- wet_Lab_data %>%
+  select(-c(OC_log, Clay_log)) %>%
+  rename("Clay (%)" = Clay,
+         "OC (%)" = OC,
+         "pH-H2O" = pH_log)
+
+ggplot(data = NIR_wet_hist.df %>%
+         pivot_longer(cols = -sample_id)) +
+  geom_histogram(aes(x = value)) +
+  facet_wrap(~ name, scales = "free_x") +
+  labs(x = "Property Value", y = "Distribution", 
+       title = "Soil Wetness Samples") +
+  theme_bw() +
+  theme(panel.grid.minor = element_blank(),
+        plot.title = element_text(size = 13, color = "Black", hjust = 0.5),
+        axis.title = element_text(size = 13, color = "Black"),
+        axis.text = element_text(size = 13, color = "Black"),
+        strip.background =element_rect(fill="white"),
+        strip.text.x = element_text(size = 13, color = "Black"))
+
+# Saving golden dry NIR property histogram figure
+ggsave("wetNIR_prop_hist_20260313.png", width = 9, height = 4, 
+       path = fig_dir, dpi = 300, units = "in")
+
+```
+
 Load and organize NIR lab and scan data.
 
 ```{r NIR_KSSL_data}
@@ -336,7 +366,7 @@ names(wet_nir_spectra) <- names(NIR_spectra %>%
 
 Plotting out NIR lab data.
 
-```{r NIR_lab_data}
+```{r NIR_lab_vis}
 
 NIR_hist.df <- NIR_Lab_data %>%
   select(c(sample_id, Clay, OC, pH_log)) %>%
@@ -348,16 +378,48 @@ ggplot(data = NIR_hist.df %>%
          pivot_longer(cols = -sample_id)) +
   geom_histogram(aes(x = value)) +
   facet_wrap(~ name, scales = "free_x") +
-  labs(x = "Property Value", y = "Distribution") +
+  labs(x = "Property Value", y = "Distribution", title = "KSSL Samples") +
   theme_bw() +
   theme(panel.grid.minor = element_blank(),
+        plot.title = element_text(size = 13, color = "Black", hjust = 0.5),
         axis.title = element_text(size = 13, color = "Black"),
         axis.text = element_text(size = 13, color = "Black"),
         strip.background =element_rect(fill="white"),
         strip.text.x = element_text(size = 13, color = "Black"))
 
 # Saving NIR property histogram figure
-ggsave("NIR_prop_hist_20260128.png", width = 9, height = 4, 
+ggsave("NIR_prop_hist_20260313.png", width = 9, height = 4, 
+       path = fig_dir, dpi = 300, units = "in")
+
+```
+
+Combined wet and KSSL organic carbon, pH, and clay distributions.
+
+```{r KSSL+wet_lab_vis}
+
+# combining KSSL and wet sample lab measured organic carbon, pH, and clay
+# ...distributions
+ggplot(data = NIR_wet_hist.df %>%
+         mutate(data = "Soil Wetness Samples") %>%
+         relocate('Clay (%)', .after = sample_id) %>%
+         relocate('pH-H2O', .after = 'OC (%)') %>%
+         rbind(NIR_hist.df %>%
+                 mutate(data = "KSSL Samples")) %>%
+         pivot_longer(cols = -c(sample_id, data))) +
+  geom_histogram(aes(x = value)) +
+  #facet_wrap(data ~ name, scales = "free_y") +
+  facet_grid(data ~ name, scales = "free") +
+  labs(x = "Property Value", y = "Distribution") +
+  theme_bw() +
+  theme(panel.grid.minor = element_blank(),
+        plot.title = element_text(size = 13, color = "Black", hjust = 0.5),
+        axis.title = element_text(size = 13, color = "Black"),
+        axis.text = element_text(size = 13, color = "Black"),
+        strip.background =element_rect(fill="white"),
+        strip.text = element_text(size = 13, color = "Black"))
+
+# Saving combined soil property distributions
+ggsave("Combined_KSSLwet_hists_20260313.png", width = 8, height = 6, 
        path = fig_dir, dpi = 300, units = "in")
 
 ```
@@ -511,40 +573,34 @@ Plotting Haar transformed NIR scan 36035_3.
 
 ```{r Haar_NIR_scan_plot}
 
-# Haar NIR scan plot
-H_NIR_scan_plot <- ggplot(data = Haar_NIR %>%
-         filter(sample_id == "36035_3") %>%
-         pivot_longer(cols = -sample_id, names_to = "Haar_level", values_to = "Value") %>%
-         mutate(Haar_level1 = sub(pattern = 'H', replacement = '', 
-                                 x = Haar_level),
-                Haar_level1 = sub(pattern = 'I', replacement = '', 
-                                 x = Haar_level1),
-                Haar_level1 = sub(pattern = '_', replacement = '.', 
-                                 x = Haar_level1),
-                Haar_level2 = str_extract(Haar_level1, "\\.\\d+"),
-                Haar_level1 = sub(pattern = '\\.\\d+', replacement = '', 
-                                 x = Haar_level1),
-                Haar_level2 = sub(pattern = '.', replacement = '', 
-                                 x = Haar_level2),
-                Haar_level2 = as.numeric(Haar_level2),
-                Haar_level2 = 1 - ((Haar_level2/1000)^(1/2)),
-                Haar_level1 = as.numeric(Haar_level1)) %>%
-                #Haar_level = Haar_level1 + Haar_level2) %>%
-           mutate(alt_transform = case_when(Haar_level1 == 0 ~ 9,
-                                            Haar_level1 == 1 ~ 8,
-                                            Haar_level1 == 2 ~ 7,
-                                            Haar_level1 == 3 ~ 6,
-                                            Haar_level1 == 4 ~ 5,
-                                            Haar_level1 == 5 ~ 4,
-                                            Haar_level1 == 6 ~ 3,
-                                            Haar_level1 == 7 ~ 2,
-                                            Haar_level1 == 8 ~ 1,
-                                            Haar_level1 == 9 ~ 0),
-                  Haar_level = alt_transform + Haar_level2),
-       aes(x = Haar_level, y = Value, group=1)) +
+# Break up Haar NIR to get separated numeric Haar order and level columns, 
+# ...with signal order preserving the order for plotting - and select sample
+longHaar <- Haar_NIR %>%
+  filter(sample_id == "36035_3") %>%
+  pivot_longer(-sample_id, 
+               names_to = 'Haar_id', values_to = 'values') %>%
+  separate_wider_delim('Haar_id', delim = '_', 
+                       names = c('Haar_level', 'Haar_order'), 
+                       cols_remove = FALSE) %>%
+  mutate(Haar_level = as.numeric(str_remove(Haar_level, '^H')),
+         Haar_order = as.numeric(str_remove(Haar_order, '^I'))) %>%
+  arrange(Haar_level, Haar_order) %>%
+  mutate(signal_order = 1:n()) %>%
+  mutate(signal_order_rev = rev(signal_order), .by = Haar_level)
+
+# Selecting the last Haar signal in levels 9 through 5 and 1, to place x-axis 
+# ...breaks in figures below
+HaarBreaks <- longHaar %>%
+  filter(Haar_order == 1,
+         Haar_level %in% c(9:5, 1))
+
+# Plotting Haar signal through transform levels
+H_NIR_scan_plot <- ggplot(longHaar, aes(x = signal_order_rev, y = values)) +
   geom_line() +
-  xlim(10, 0.0) +
   labs(y = "Transformed Reflectance", x = "Haar Transform Levels") +
+  scale_x_continuous(breaks = HaarBreaks$signal_order_rev,
+                     #labels = HaarBreaks$Haar_level) +
+                     labels = 10-HaarBreaks$Haar_level) +
   theme_bw() +
   theme(legend.position = "none",
         panel.background = element_blank(),
@@ -552,13 +608,11 @@ H_NIR_scan_plot <- ggplot(data = Haar_NIR %>%
         panel.grid.minor = element_blank(),
         axis.title = element_text(size = 13, color = "Black"),
         axis.text = element_text(size = 13, color = "Black"))
-  #scale_x_continuous(labels = scales::number_format(accuracy = 1))
-  #scale_x_reverse()
 
 print(H_NIR_scan_plot)
 
 # Saving NIR scan plot
-ggsave("Haar_NIR_plot_20260129.png", width = 6, height = 4,
+ggsave("Haar_NIR_plot_20260313.png", width = 6, height = 4,
        path = fig_dir, dpi = 300, units = "in")
 
 ```
@@ -733,33 +787,41 @@ All_BT_scan_plot <- ggplot(data = full_back_trans.df %>%
                                     MRA_value == 4 |
                                     MRA_value == 6 |
                                     MRA_value == 7 |
-                                    MRA_value == 8),
+                                    MRA_value == 8) %>%
+                             mutate(MRA_value = gsub(0, "Full Haar", MRA_value),
+                                    MRA_value = gsub(2, "50% Haar", MRA_value),
+                                    MRA_value = gsub(4, "13% Haar", MRA_value),
+                                    MRA_value = gsub(6, "4.0% Haar", MRA_value),
+                                    MRA_value = gsub(7, "2.0% Haar", MRA_value),
+                                    MRA_value = gsub(8, "1.0% Haar", 
+                                                     MRA_value)),
                            aes(x = Wavelength, y = Reflectance, 
                                  color = as.factor(MRA_value))) +
   geom_line() +
   geom_point(data = full_back_trans.df %>% 
-               filter(MRA_value == 8), 
+               mutate(MRA_value = gsub(8, "1.0% Haar", MRA_value)) %>%
+               filter(MRA_value == "1.0% Haar"), 
              aes(x = Wavelength, y = Reflectance, 
                  color = as.factor(MRA_value))) +
-  labs(y = "Back-transformed Reflectance", x = "Wavelength (nm)",
-       color = "Haar Transform Level") +
+  labs(y = "Back-transformed Reflectance", x = "Wavelength (nm)") +
   theme_bw() +
   theme(legend.position = "bottom",
-        legend.title = element_text(size = 13, color = "Black"),
+        legend.title = element_blank(),
         legend.text = element_text(size = 13, color = "Black"),
         panel.background = element_blank(),
         panel.grid.major = element_blank(),
         panel.grid.minor = element_blank(),
         axis.title = element_text(size = 13, color = "Black"),
         axis.text = element_text(size = 13, color = "Black")) +
-  scale_color_grey(limits = c("0", "2", "4", "6", "7", "8")) +
+  scale_color_grey(limits = c("Full Haar", "50% Haar", "13% Haar", "4.0% Haar",
+                              "2.0% Haar", "1.0% Haar")) +
   #scale_x_reverse() +
   guides(color = guide_legend(nrow = 1, override.aes = list(shape = NA)))
 
 print(All_BT_scan_plot)
 
 # Saving reverse Haar NIR scan plot
-ggsave("All_levels_RevHaar_NIR_plot_20260129.png", width = 8, height = 4,
+ggsave("All_levels_RevHaar_NIR_plot_20260310.png", width = 8, height = 4,
        path = fig_dir, dpi = 300, units = "in")
 
 ```
@@ -779,7 +841,7 @@ ggarrange(reg, All_BT_scan_plot, nrow = 2,
           labels = c("", "c"))
 
 # Saving arrangement of NIR, Haar, and reverse Haar scan plots
-ggsave("NIRHaarRHaar_plots_20260129.png", width = 9, height = 9,
+ggsave("NIRHaarRHaar_plots_20260313.png", width = 9, height = 9,
        path = fig_dir, dpi = 300, units = "in")
 
 ```
@@ -1447,37 +1509,8 @@ ggsave("SubdryNIR_ModelVal_perf_hist_20251203.png", width = 15, height = 12,
 
 ```
 
-# Wet NIR data
 
-Plotting out wet lab data.
-
-```{r wet_lab_data}
-
-NIR_wet_hist.df <- wet_Lab_data %>%
-  select(-c(OC_log, Clay_log)) %>%
-  rename("Clay (%)" = Clay,
-         "OC (%)" = OC,
-         "pH-H2O" = pH_log)
-
-ggplot(data = NIR_wet_hist.df %>%
-         pivot_longer(cols = -sample_id)) +
-  geom_histogram(aes(x = value)) +
-  facet_wrap(~ name, scales = "free_x") +
-  labs(x = "Property Value", y = "Distribution") +
-  theme_bw() +
-  theme(panel.grid.minor = element_blank(),
-        axis.title = element_text(size = 13, color = "Black"),
-        axis.text = element_text(size = 13, color = "Black"),
-        strip.background =element_rect(fill="white"),
-        strip.text.x = element_text(size = 13, color = "Black"))
-
-# Saving golden dry NIR property histogram figure
-ggsave("wetNIR_prop_hist_20260128.png", width = 9, height = 4, 
-       path = fig_dir, dpi = 300, units = "in")
-
-```
-
-##  Train and validate wet NIR model
+#  Train and validate wet NIR model
 
 Train and validate wet model using wet lab and NIR data.
 
@@ -2348,7 +2381,7 @@ ggsave("sub_DryWet_ModelVal_perf_hist_20251118.png", width = 12, height = 12,
 
 ```
 
-# Wet Haar data
+# Haar transformed wet data
 
 Haar transformation of wet NIR scans
 
