@@ -813,8 +813,8 @@ All_BT_scan_plot <- ggplot(data = full_back_trans.df %>%
         panel.grid.minor = element_blank(),
         axis.title = element_text(size = 13, color = "Black"),
         axis.text = element_text(size = 13, color = "Black")) +
-  scale_color_grey(limits = c("Full Haar", "50% Haar", "13% Haar", "4.0% Haar",
-                              "2.0% Haar", "1.0% Haar")) +
+  scale_color_grey(limits = c("Full Haar", "50% Haar", "12% Haar", "3.0% Haar",
+                              "1.0% Haar", "0.5% Haar")) +
   #scale_x_reverse() +
   guides(color = guide_legend(nrow = 1, override.aes = list(shape = NA)))
 
