@@ -1,7 +1,7 @@
 ---
 title: "NIR and Haar wet sample predictions"
 author:
-- D Bloom <develyn.bloom@ufl.edu>, University of Florida
+- "D Bloom <develyn.bloom@ufl.edu>, University of Florida"
 - "K Todd-Brown <ktoddbrown@ufl.edu>, University of Florida"
 date: "Summer 2025"
 output:

@@ -790,10 +790,10 @@ All_BT_scan_plot <- ggplot(data = full_back_trans.df %>%
                                     MRA_value == 8) %>%
                              mutate(MRA_value = gsub(0, "Full Haar", MRA_value),
                                     MRA_value = gsub(2, "50% Haar", MRA_value),
-                                    MRA_value = gsub(4, "13% Haar", MRA_value),
-                                    MRA_value = gsub(6, "4.0% Haar", MRA_value),
-                                    MRA_value = gsub(7, "2.0% Haar", MRA_value),
-                                    MRA_value = gsub(8, "1.0% Haar", 
+                                    MRA_value = gsub(4, "12% Haar", MRA_value),
+                                    MRA_value = gsub(6, "3.0% Haar", MRA_value),
+                                    MRA_value = gsub(7, "1.0% Haar", MRA_value),
+                                    MRA_value = gsub(8, "0.5% Haar", 
                                                      MRA_value)),
                            aes(x = Wavelength, y = Reflectance, 
                                  color = as.factor(MRA_value))) +
