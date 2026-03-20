@@ -179,14 +179,14 @@ PLSR_wet <- ggplot(data = wet_perf_fig.df %>%
   scale_y_discrete(limits = c("0.5% Haar", "1.0% Haar", "3.0% Haar", 
                               "6.0% Haar", "12% Haar", "25% Haar", "50% Haar",
                               "100% Haar", "Full Haar", "NIR")) +
-  scale_color_manual(values = c("red3", "forestgreen", "royalblue3")) +
+  scale_color_manual(values = c("#CC79A7", "#D55E00", "#0072B2")) +
   #scale_color_manual(values=c("mediumpurple1", "palevioletred1", "turquoise3")) +
   theme(legend.background = element_rect(fill = "transparent"),
         legend.key = element_rect(colour = NA, fill = NA),
         legend.box.background = element_blank())
 
 # Save PLSR sample wetness plot separately
-ggsave("PLSR_wet_facets_20260129.png", width = 8, height = 7, 
+ggsave("PLSR_wet_facets_20260320.png", width = 8, height = 7, 
        path = fig_dir, dpi = 300, units = "in")
 
 ## Cubist facet
@@ -224,20 +224,20 @@ Cubist_wet <- ggplot(data = wet_perf_fig.df %>%
   scale_y_discrete(limits = c("0.5% Haar", "1.0% Haar", "3.0% Haar", 
                               "6.0% Haar", "12% Haar", "25% Haar", "50% Haar",
                               "100% Haar", "Full Haar", "NIR")) +
-  scale_color_manual(values = c("red3", "forestgreen", "royalblue3")) +
+  scale_color_manual(values = c("#CC79A7", "#D55E00", "#0072B2")) +
   theme(legend.background = element_rect(fill = "transparent"),
         legend.key = element_rect(colour = NA, fill = NA),
         legend.box.background = element_blank())
 
 # Save Cubist sample wetness plot separately
-ggsave("Cubist_wet_facets_20260129.png", width = 8, height = 7, 
+ggsave("Cubist_wet_facets_20260320.png", width = 8, height = 7, 
        path = fig_dir, dpi = 300, units = "in")
 
 # Arranging PLSR and Cubist plots
 ggarrange(PLSR_wet, Cubist_wet, nrow = 2, labels = c("a","b"))
 
 # Save sample wetness arranged plot
-ggsave("Wet_facets_20260129.png", width = 9, height = 9, 
+ggsave("Wet_facets_20260230.png", width = 9, height = 9, 
        path = fig_dir, dpi = 300, units = "in")
 
 ```
@@ -471,7 +471,7 @@ PLSR <- ggplot(data = both_tradeoff.df %>%
                               "6.0% Haar", "12% Haar", "25% Haar", "50% Haar",
                               "100% Haar", "Full Haar", "NIR")) +
   scale_x_continuous(labels = scales::number_format(accuracy = .1)) +
-  scale_color_manual(values=c("#F8766D", "#00BA38", "#619CFF"))
+  scale_color_manual(values=c("#CC79A7", "#D55E00", "#0072B2"))
 
 Cubist <- ggplot(data = both_tradeoff.df %>%
                  filter(model == 'Cubist'),
@@ -500,7 +500,7 @@ Cubist <- ggplot(data = both_tradeoff.df %>%
   scale_y_discrete(limits = c("0.5% Haar", "1.0% Haar", "3.0% Haar", 
                               "6.0% Haar", "12% Haar", "25% Haar", "50% Haar",
                               "100% Haar", "Full Haar", "NIR")) +
-  scale_color_manual(values=c("#F8766D", "#00BA38", "#619CFF")) +
+  scale_color_manual(values=c("#CC79A7", "#D55E00", "#0072B2")) +
   scale_x_continuous(labels = scales::number_format(accuracy = .1)) +
   theme(legend.background = element_rect(fill = "transparent"),
         legend.key = element_rect(colour = NA, fill = NA),
@@ -508,7 +508,7 @@ Cubist <- ggplot(data = both_tradeoff.df %>%
 
 ggarrange(PLSR, Cubist, nrow = 2, labels = c("a","b"))
 
-ggsave("NIR_tradeoff_facets_20260129.png", width = 9.5, height = 11, 
+ggsave("NIR_tradeoff_facets_20260320.png", width = 9.5, height = 11, 
        path = fig_dir, dpi = 300, units = "in")
 
 ```
